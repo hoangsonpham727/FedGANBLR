@@ -54,9 +54,6 @@ Add dataset entries to `DATASETS` in `main.py`. Ensure the dataset loader in the
 ## Outputs
 Experiment results, logs, and any saved models are produced by the evaluation routines. Check configured output directories in the evaluation code.
 
-## Contributing
-- Open issues for bugs/features
-- Send PRs with tests and concise commits
 
-## License
-Specify project license in `LICENSE` file (add one if missing).
+
+
