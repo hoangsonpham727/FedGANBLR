@@ -1,0 +1,23 @@
+# --- OS & IDE ---
+.DS_Store
+.vscode/
+
+# --- Python & Performance ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Data & Artifacts (Heavy/Non-Source) ---
+# These are likely your raw data splits and model weights
+raw_folds/
+fold_artifacts/
+
+
+# --- Results & Output ---
+ablation_results/
+final_results/
+
+# --- Jupyter Notebook Checkpoints ---
+.ipynb_checkpoints
+
+ablation_analysis.py
