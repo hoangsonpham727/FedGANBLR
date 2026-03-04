@@ -10,7 +10,7 @@ Federated tabular data generator and benchmark for FedGANBLR . This repo runs ce
 
 ## Requirements
 - Python 3.8+
-- Typical ML libraries (e.g., numpy, pandas, scikit-learn, PyTorch or TensorFlow depending on implementation)
+- Typical ML libraries (e.g., numpy, pandas, scikit-learn, and TensorFlow)
 - See `requirements.txt` 
 
 ## Installation
