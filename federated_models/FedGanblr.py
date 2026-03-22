@@ -99,10 +99,6 @@ def _mixture_kl_weights(counts_loc: dict[int, np.ndarray],
         s[v] = W.astype(np.float32)
     return s
 
-
-""" 
-Compute client importance weights using models' parameters (probs)
-"""
 def _disc_local_thetas_from_logits(gen: 'DiscBN_KDB') -> dict[int, np.ndarray]:
     """
     Return local CPTs theta_loc[v] in probability space from a constrained DiscBN_KDB.
@@ -198,35 +194,6 @@ def _mixture_kl_weights_with_theta(counts_loc: dict[int, np.ndarray],
         s[v] = W.astype(np.float32)
     
     return s
-
-
-
-"""
-Federated-GANBLR 
-Key points:
-- Server selects global K (kdb parents) using a bootstrap client (round 0 init).
-- Metadata broadcast: {k, card, parents (list of parent lists per feature index), y_index}.
-- Each client:
-    * Receives metadata (if first round, builds its own if absent).
-    * Adversarially trains local GANBLR on its integer-encoded (X_int, y_int).
-    * Extracts generator parameters: class prior py and per-feature CPT theta[v].
-    * Sends:
-        - py (as probability vector)
-        - For each feature v != y_index: theta[v] flattened
-        - Per-feature shape info & parent list (in metadata JSON once)
-        - Local sample count n
-        - Local label marginal (for KL weighting)
-        - Synthetic-vs-real marginal KL (diagnostic)
-- Server aggregates:
-    * Reconstructs per-client py/theta blocks
-    * Computes reference (previous global) distribution
-    * KL_i over (py + concatenated theta rows) vs reference
-    * Weight w_i = n_i * exp(-gamma * KL_i) (gamma same semantics as FedGANBLR)
-    * Weighted average in probability space -> new global py / theta.
-    * Broadcasts updated global model next round.
-"""
-
-
 
 def serialize_kdb_generator(gen: 'MLE_KDB') -> Dict[str, Any]:
     """
@@ -509,26 +476,13 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
         disc_epochs = _to_int(config.get("disc_epochs", 1), 1)
         adversarial_flag = str(config.get("adversarial", "1")).lower() in ("1", "true", "yes")
         verbose = str(config.get("verbose", "0")).lower() in ("1", "true", "yes")
-        try:
-            cpt_mix = float(config.get("cpt_mix", 0.0))
-        except Exception:
-            cpt_mix = 0.0
-        try:
-            kl_lambda = float(config.get("kl_lambda", 0.0))
-        except Exception:
-            kl_lambda = 0.0
-        try:
-            alpha_mix = float(config.get("alpha_mix", 0.5))
-        except Exception:
-            alpha_mix = 0.5
-        try:
-            beta_pow = float(config.get("beta_pow", 0.5))
-        except Exception:
-            beta_pow = 0.5
-        try:
-            tau_floor = float(config.get("tau_floor", 1e-6))
-        except Exception:
-            tau_floor = 1e-6
+        
+        cpt_mix = float(config.get("cpt_mix", 0.0))
+        kl_lambda = float(config.get("kl_lambda", 0.0))
+        alpha_mix = float(config.get("alpha_mix", 0.5))
+        beta_pow = float(config.get("beta_pow", 0.5))
+        tau_floor = float(config.get("tau_floor", 1e-6))
+ 
 
         # Parse optional global model to warm-start / form KL targets
         py_glob, thetas_glob = None, None
@@ -787,7 +741,11 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
                 py_new = (1.0 - cpt_mix) * py_local + cpt_mix * py_glob
                 py_new = np.clip(py_new, 1e-12, None); py_new = py_new / py_new.sum()
                 try:
-                    ganblr.generator.logits_y.assign(tf.math.log(tf.add(tf.constant(py_new, dtype=tf.float32), 1e-12)))
+                    if ganblr.generator.logits_y is not None: 
+
+                        ganblr.generator.logits_y.assign(tf.math.log(tf.add(tf.constant(py_new, dtype=tf.float32), 1e-12)))
+                    else:
+                        raise AttributeError("logits_y is None")
                 except Exception:
                     try:
                         if hasattr(ganblr.generator, "py"):
