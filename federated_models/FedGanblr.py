@@ -529,37 +529,12 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
         V = len(card)
         parents_excl_y = {v: [p for p in parents_full.get(v, []) if p != y_index] for v in range(V) if v != y_index}
 
-        # Build training table (Y first)
+        # Sanitize once at the client boundary so the live training tensors are valid.
         train_arr = np.column_stack([self.y, self.X]).astype(np.int32)
-        N = self.X.shape[0]
-
-        # Sanitize client-side integer arrays to match server card 
-        for col in range(self.X.shape[1]):
-            # card has Y first, then features at indices 1..V-1
-            card_idx = col + 1
-            if card_idx < len(card):
-                max_allowed = int(card[card_idx])
-                if max_allowed <= 0:
-                    continue
-                # any values >= max_allowed are invalid; clip to max_allowed-1
-                mask = self.X[:, col] >= max_allowed
-                if mask.any():
-                    warnings.warn(f"Client {self.cid}: feature col {col} contains values >= card[{card_idx}]={max_allowed}; clipping to {max_allowed-1}")
-                    self.X[mask, col] = max_allowed - 1
-
-        # sanitize labels too
-        max_y = int(card[y_index]) if y_index < len(card) else None
-        if max_y is not None:
-            masky = self.y >= max_y
-            if masky.any():
-                warnings.warn(f"Client {self.cid}: label values >= |Y|={max_y}; clipping to {max_y-1}")
-                self.y[masky] = max_y - 1
-
-        # Rebuild train_arr after sanitization
-        train_arr = np.column_stack([self.y, self.X]).astype(np.int32)
-        
-        # Final validation: ensure all values in train_arr are within valid ranges
         train_arr = _validate_train_arr(train_arr, card, client_id=self.cid, verbose=verbose)
+        self.y = train_arr[:, 0].astype(np.int32)
+        self.X = train_arr[:, 1:].astype(np.int32)
+        N = self.X.shape[0]
 
         # Parse global parameters if available (received from server)
         global_json = config.get("global_json", None)

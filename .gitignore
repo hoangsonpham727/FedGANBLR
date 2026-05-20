@@ -21,3 +21,4 @@ final_results/
 .ipynb_checkpoints
 
 ablation_analysis.py
+*.csv
