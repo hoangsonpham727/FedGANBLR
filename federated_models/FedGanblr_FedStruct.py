@@ -24,11 +24,12 @@ class GANBLRFederatedClient_FedStruct(GANBLRFederatedClient):
             train_arr = np.column_stack([self.y, self.X]).astype(np.int32)
             parents, _ = _build_kdb_structure(train_arr, card, y_index, k=k)
             
-            # Return discovered parents into metrics payload
+            # Filter out the y_index entry (always empty, ignored by set_global_meta)
+            parents_filtered = {v: ps for v, ps in parents.items() if v != y_index}
             metrics = {
                 "cid": self.cid,
                 "n": self.n,
-                "local_parents_json": json.dumps(parents)
+                "local_parents_json": json.dumps(parents_filtered)
             }
             return [np.array([0.0], dtype=np.float32)], self.n, metrics
         else:
@@ -86,29 +87,56 @@ class KDBGANStrategy_FedStruct(KDBGANStrategy):
     def aggregate_fit(self, server_round, results, failures):
         server_round = int(server_round)
         if server_round == 1:
-            # Aggregate structures strictly via Union
-            global_parents_set = {}
+            # Collect per-edge vote counts weighted by client sample size
+            edge_votes = {}    # (v, parent) -> total sample weight
+            total_n = 0
+            n_reporting = 0
+
             for _, fit_res in results:
                 metrics = fit_res.metrics or {}
-                if "local_parents_json" in metrics:
-                    local_parents = json.loads(metrics["local_parents_json"])
-                    for v_str, parents_list in local_parents.items():
-                        v = int(v_str)
-                        if v not in global_parents_set:
-                            global_parents_set[v] = set()
-                        global_parents_set[v].update(parents_list)
-            
-            # Convert sets to sorted lists
-            final_parents = {v: sorted(list(pset)) for v, pset in global_parents_set.items()}
-            
-            # Reconstruct global meta with our union graph
-            if getattr(self, "meta", None):
-                card = self.meta["card"]
-                y_index = self.meta["y_index"]
-                # Parents map needs to exclude Y initially as set_global_meta internally prepends Y
-                self.set_global_meta(card, final_parents, y_index)
-                
-            return fl.common.ndarrays_to_parameters([]), {"phase": "structure_aggregated", "round": server_round}
+                if "local_parents_json" not in metrics:
+                    continue
+                n_local = int(metrics.get("n", fit_res.num_examples))
+                n_reporting += 1
+                total_n += n_local
+                local_parents = json.loads(metrics["local_parents_json"])
+                for v_str, parents_list in local_parents.items():
+                    v = int(v_str)
+                    for p in parents_list:
+                        key = (v, int(p))
+                        edge_votes[key] = edge_votes.get(key, 0) + n_local
+
+            if n_reporting == 0:
+                import warnings
+                warnings.warn("FedStruct: No clients reported structure in round 1. "
+                              "Falling back to Naive Bayes (Y-only parents).")
+
+            # For each feature, keep only the top-k parents by vote weight
+            k = int(self.k)
+            y_index = int(self.meta["y_index"])
+            card = self.meta["card"]
+            V = len(card)
+            final_parents = {}
+            for v in range(V):
+                if v == y_index:
+                    continue
+                # Gather all candidate parents for this feature with their votes
+                candidates = []
+                for (fv, p), weight in edge_votes.items():
+                    if fv == v:
+                        candidates.append((p, weight))
+                # Sort by vote weight descending, take top-k
+                candidates.sort(key=lambda t: -t[1])
+                final_parents[v] = [p for p, _ in candidates[:k]]
+
+            self.set_global_meta(card, final_parents, y_index)
+
+            return fl.common.ndarrays_to_parameters([]), {
+                "phase": "structure_aggregated",
+                "round": server_round,
+                "n_reporting_clients": n_reporting,
+                "total_edges_before_cap": len(edge_votes),
+            }
         else:
             # Regular parameter aggregation
             return super().aggregate_fit(server_round, results, failures)
