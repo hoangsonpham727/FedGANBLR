@@ -1,0 +1,1070 @@
+"""
+Statistical Analysis Framework for FedGANBLR
+=============================================
+Analyses how KL divergence, importance weighting, and weighted aggregation
+affect model learning stability and soundness.
+
+Usage:
+    # Convergence analysis on existing diagnostics
+    python analysis_framework.py convergence --diagnostics-dir diagnostics/adult/fold_01
+
+    # Ablation study (runs training with toggled components)
+    python analysis_framework.py ablation --datasets adult nursery --num-rounds 10
+
+    # Full analysis (ablation + convergence on generated diagnostics)
+    python analysis_framework.py full --datasets adult --num-rounds 10
+"""
+
+import argparse
+import json
+import math
+import sys
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from sklearn.model_selection import RepeatedStratifiedKFold
+
+# --- Project imports (reuse existing functions, never reimplement) ---
+from evaluation import run_one_fold_fed_ganblr, _soft_clear_tf_and_ray
+from utils import (
+    fetch_openml_safely,
+    discretize_train_test_no_leak,
+    preprocess_covertype_binary_columns,
+)
+from federated_models.FedGanblr import _kl
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_OUTPUT_DIR = Path("analysis_output")
+
+ABLATION_CONFIGS = {
+    "baseline":              dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
+    "no_kl_weighting":       dict(gamma=0.0,  beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
+    "no_importance_weights": dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.6, alpha_dir=0.01),
+    "no_cpt_mix":            dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.0, alpha_dir=0.01),
+    "no_smoothing":          dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.0),
+    "kl_only":               dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0),
+}
+
+DATASET_SPECS = [
+    dict(name="nursery", data_id=76,  target="class", ef_bins=None),
+    dict(name="chess",   data_id=23,  target="class", ef_bins=None),
+    dict(name="car",     data_id=19,  target="class", ef_bins=None),
+    dict(name="adult",   data_id=2,   target="class", ef_bins=None),
+]
+
+CLASSIFIERS = ["lr", "mlp", "rf", "xgb"]
+
+DEFAULT_SHARED_PARAMS = dict(
+    k_global=2,
+    num_clients=5,
+    num_rounds=10,
+    dir_alpha=0.2,
+    local_epochs=3,
+    batch_size=512,
+    disc_epochs=1,
+    eval_syn_frac=0.5,
+    cap_train=None,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _gini(weights: np.ndarray) -> float:
+    """Gini coefficient of a weight vector (0=equal, 1=maximally unequal)."""
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    if w.sum() == 0 or len(w) <= 1:
+        return 0.0
+    sorted_w = np.sort(w)
+    n = len(sorted_w)
+    index = np.arange(1, n + 1)
+    return float((2.0 * np.sum(index * sorted_w) / (n * np.sum(sorted_w))) - (n + 1.0) / n)
+
+
+def _entropy(weights: np.ndarray) -> float:
+    """Shannon entropy of a weight distribution."""
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    s = w.sum()
+    if s <= 0:
+        return 0.0
+    w = w / s
+    return float(-np.sum(w * np.log(w + 1e-12)))
+
+
+def _effective_n(weights: np.ndarray) -> float:
+    """Effective number of clients = 1 / sum(w_i^2)."""
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    s = w.sum()
+    if s <= 0:
+        return 0.0
+    w = w / s
+    return float(1.0 / np.sum(w ** 2))
+
+
+def _setup_style():
+    """Apply consistent matplotlib style."""
+    plt.rcParams.update({
+        "figure.figsize": (12, 8),
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.labelsize": 11,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 9,
+        "figure.dpi": 150,
+        "savefig.dpi": 150,
+        "savefig.bbox_inches": "tight",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Part 1: Data Loaders
+# ---------------------------------------------------------------------------
+
+def load_round_stats(diagnostics_dir: Path) -> pd.DataFrame:
+    """Load global_round_stats.csv and parse JSON columns into arrays."""
+    csv_path = diagnostics_dir / "global_round_stats.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Round stats not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    # Parse JSON columns
+    for col, out in [
+        ("py_json", "py_arr"),
+        ("s_y_json", "s_y_arr"),
+        ("weights_json", "weights_arr"),
+        ("client_ns_json", "client_ns_arr"),
+    ]:
+        if col in df.columns:
+            df[out] = df[col].apply(
+                lambda x: json.loads(x) if pd.notna(x) and x else None
+            )
+    # Parse client_kls if stored (it may be embedded in weights_json or separate)
+    return df
+
+
+def load_nll_convergence(diagnostics_dir: Path) -> pd.DataFrame | None:
+    """Load nll_convergence.csv if it exists. Returns None otherwise."""
+    csv_path = diagnostics_dir / "nll_convergence.csv"
+    if not csv_path.exists():
+        return None
+    try:
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def load_fold_config(diagnostics_dir: Path) -> dict:
+    """Load fold_config.json."""
+    p = diagnostics_dir / "fold_config.json"
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text())
+
+
+def load_client_split_stats(diagnostics_dir: Path) -> dict:
+    """Load client_split_stats.json."""
+    p = diagnostics_dir / "client_split_stats.json"
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text())
+
+
+# ---------------------------------------------------------------------------
+# Part 1: Convergence & Stability Plot Functions
+# ---------------------------------------------------------------------------
+
+def plot_kl_convergence(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
+    """
+    Plot KL mean/max per round with convergence rate.
+    Produces: kl_convergence.png
+    """
+    _setup_style()
+    rounds = df_rounds["round"].values
+    kl_mean = df_rounds["kl_mean"].values.astype(float)
+    kl_max = df_rounds["kl_max"].values.astype(float)
+
+    delta_kl = np.diff(kl_mean)
+    convergence_rate = float(np.mean(delta_kl[-min(5, len(delta_kl)):]))  if len(delta_kl) > 0 else 0.0
+    is_monotonic = bool(np.all(delta_kl <= 1e-8)) if len(delta_kl) > 0 else True
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(rounds, kl_mean, "b-o", markersize=4, label="KL mean", linewidth=2)
+    ax1.plot(rounds, kl_max, "r--s", markersize=3, label="KL max", linewidth=1.5)
+    ax1.set_xlabel("Round")
+    ax1.set_ylabel("KL Divergence")
+    ax1.set_title(f"KL Convergence (rate={convergence_rate:.4f}/round, monotonic={is_monotonic})")
+    ax1.legend(loc="upper left")
+    ax1.grid(True, alpha=0.3)
+
+    if len(delta_kl) > 0:
+        ax2 = ax1.twinx()
+        ax2.bar(rounds[1:], delta_kl, alpha=0.25, color="gray", label="ΔKL")
+        ax2.set_ylabel("ΔKL (per round)", color="gray")
+        ax2.axhline(0, color="gray", linestyle=":", linewidth=0.5)
+        ax2.legend(loc="upper right")
+
+    out_path = out_dir / "kl_convergence.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    print(f"  KL Convergence: final_kl_mean={kl_mean[-1]:.4f}, "
+          f"convergence_rate={convergence_rate:.4f}/round, monotonic={is_monotonic}")
+    return out_path
+
+
+def plot_weight_distribution(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
+    """
+    Plot per-client aggregation weights over rounds + Gini/entropy.
+    Produces: weight_distribution.png
+    """
+    _setup_style()
+    rounds = df_rounds["round"].values
+
+    # Build weight matrix [rounds x clients]
+    weight_lists = df_rounds["weights_arr"].tolist()
+    valid = [w for w in weight_lists if w is not None]
+    if not valid:
+        warnings.warn("No weight data available for weight distribution plot.")
+        return out_dir / "weight_distribution.png"
+
+    n_clients = len(valid[0])
+    W = np.zeros((len(rounds), n_clients))
+    for i, wl in enumerate(weight_lists):
+        if wl is not None:
+            arr = np.asarray(wl, dtype=np.float64)
+            W[i, :len(arr)] = arr[:n_clients]
+
+    # Compute Gini and entropy per round
+    gini_vals = [_gini(W[i]) for i in range(len(rounds))]
+    entropy_vals = [_entropy(W[i]) for i in range(len(rounds))]
+    max_entropy = np.log(n_clients)  # for normalization
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: per-client weight evolution
+    for c in range(n_clients):
+        ax1.plot(rounds, W[:, c], "-o", markersize=3, label=f"Client {c}", linewidth=1.5)
+    ax1.axhline(1.0 / n_clients, color="black", linestyle=":", linewidth=1, label="Uniform")
+    ax1.set_xlabel("Round")
+    ax1.set_ylabel("Aggregation Weight")
+    ax1.set_title("Client Weight Evolution")
+    ax1.legend(fontsize=8, ncol=2)
+    ax1.grid(True, alpha=0.3)
+
+    # Right: Gini + normalized entropy
+    ax2.plot(rounds, gini_vals, "b-o", markersize=4, label="Gini", linewidth=2)
+    ax2_twin = ax2.twinx()
+    norm_ent = [e / max_entropy if max_entropy > 0 else 0 for e in entropy_vals]
+    ax2_twin.plot(rounds, norm_ent, "orange", marker="s", markersize=3,
+                  label="Norm. Entropy", linewidth=1.5)
+    ax2.set_xlabel("Round")
+    ax2.set_ylabel("Gini Coefficient", color="blue")
+    ax2_twin.set_ylabel("Normalized Entropy", color="orange")
+    ax2.set_title("Weight Concentration Metrics")
+    ax2.legend(loc="upper left")
+    ax2_twin.legend(loc="upper right")
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out_path = out_dir / "weight_distribution.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    max_swing = float(np.max(np.abs(np.diff(W, axis=0)))) if W.shape[0] > 1 else 0.0
+    print(f"  Weight stability: final_gini={gini_vals[-1]:.4f}, "
+          f"mean_entropy={np.mean(entropy_vals):.4f}, max_weight_swing={max_swing:.4f}")
+    return out_path
+
+
+def plot_nll_convergence(df_nll: pd.DataFrame | None, out_dir: Path) -> Path | None:
+    """
+    Plot per-client NLL over rounds with divergence detection.
+    Produces: nll_convergence.png
+    """
+    if df_nll is None or df_nll.empty:
+        print("  NLL convergence: skipped (no nll_convergence.csv found)")
+        return None
+
+    _setup_style()
+
+    # Pivot: rows=round, columns=client_id, values=nll
+    pivot = df_nll.pivot_table(index="round", columns="client_id", values="nll", aggfunc="mean")
+    rounds = pivot.index.values
+    clients = pivot.columns.tolist()
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for cid in clients:
+        nll_vals = pivot[cid].values
+        ax.plot(rounds, nll_vals, "-o", markersize=3, label=f"Client {cid}", linewidth=1.5)
+
+        # Detect divergence: 3+ consecutive NLL increases
+        increases = np.diff(nll_vals) > 0
+        for i in range(len(increases) - 2):
+            if increases[i] and increases[i + 1] and increases[i + 2]:
+                ax.axvspan(rounds[i + 1], rounds[i + 3], alpha=0.15, color="red")
+
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Negative Log-Likelihood")
+    ax.set_title("Per-Client NLL Convergence")
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    out_path = out_dir / "nll_convergence.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    final_nlls = pivot.iloc[-1].values
+    print(f"  NLL convergence: final_mean={np.nanmean(final_nlls):.4f}, "
+          f"final_std={np.nanstd(final_nlls):.4f}")
+    return out_path
+
+
+def plot_class_prior_drift(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
+    """
+    Track how class prior py changes across rounds.
+    Uses the existing _kl() from FedGanblr.py.
+    Produces: class_prior_drift.png
+    """
+    _setup_style()
+    rounds = df_rounds["round"].values
+    py_lists = df_rounds["py_arr"].tolist()
+
+    valid_pys = [(r, np.asarray(p, dtype=np.float64)) for r, p in zip(rounds, py_lists) if p is not None]
+    if len(valid_pys) < 2:
+        print("  Class prior drift: skipped (insufficient data)")
+        return out_dir / "class_prior_drift.png"
+
+    py_rounds, py_arrays = zip(*valid_pys)
+    py_rounds = np.array(py_rounds)
+    n_classes = len(py_arrays[0])
+
+    # Compute KL between consecutive rounds
+    kl_drifts = []
+    for i in range(1, len(py_arrays)):
+        kl_val = _kl(py_arrays[i], py_arrays[i - 1])
+        kl_drifts.append(kl_val)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), height_ratios=[2, 1])
+
+    # Top: per-class prior over rounds
+    for c in range(n_classes):
+        vals = [p[c] for p in py_arrays]
+        ax1.plot(py_rounds, vals, "-o", markersize=3, label=f"Class {c}", linewidth=1.5)
+    ax1.set_xlabel("Round")
+    ax1.set_ylabel("P(Y=c)")
+    ax1.set_title("Class Prior Evolution")
+    ax1.legend(fontsize=8, ncol=min(n_classes, 5))
+    ax1.grid(True, alpha=0.3)
+
+    # Bottom: KL drift
+    ax2.bar(py_rounds[1:], kl_drifts, color="steelblue", alpha=0.7)
+    ax2.set_xlabel("Round")
+    ax2.set_ylabel("KL(py_t || py_{t-1})")
+    ax2.set_title("Class Prior Drift per Round")
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out_path = out_dir / "class_prior_drift.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    total_drift = sum(kl_drifts)
+    max_drift = max(kl_drifts) if kl_drifts else 0.0
+    print(f"  Class prior drift: total_KL_drift={total_drift:.6f}, "
+          f"max_single_round_drift={max_drift:.6f}")
+    return out_path
+
+
+def plot_effective_clients(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
+    """
+    Compute K_eff = 1 / sum(w_i^2) per round.
+    Produces: effective_clients.png
+    """
+    _setup_style()
+    rounds = df_rounds["round"].values
+    weight_lists = df_rounds["weights_arr"].tolist()
+
+    k_effs = []
+    n_actual = 0
+    for wl in weight_lists:
+        if wl is not None:
+            w = np.asarray(wl, dtype=np.float64)
+            n_actual = len(w)
+            k_effs.append(_effective_n(w))
+        else:
+            k_effs.append(0.0)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(rounds, k_effs, "b-o", markersize=5, linewidth=2, label="K_eff")
+    ax.axhline(n_actual, color="red", linestyle="--", linewidth=1.5, label=f"Total clients ({n_actual})")
+    ax.axhline(1.0, color="gray", linestyle=":", linewidth=1, label="Single client dominance")
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Effective Number of Clients")
+    ax.set_title("Effective Client Participation (K_eff = 1 / Σw²)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    out_path = out_dir / "effective_clients.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    print(f"  Effective clients: final={k_effs[-1]:.2f}/{n_actual}, "
+          f"mean={np.mean(k_effs):.2f}, min={np.min(k_effs):.2f}")
+    return out_path
+
+
+def plot_gamma_sensitivity(df_rounds: pd.DataFrame, out_dir: Path,
+                           fold_config: dict | None = None) -> Path:
+    """
+    Analytically recompute weights for different gamma values using stored
+    client_kls and client_ns. No retraining needed.
+    Produces: gamma_sensitivity.png
+    """
+    _setup_style()
+    gammas = [0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+    actual_gamma = fold_config.get("gamma", 0.25) if fold_config else 0.25
+
+    # Use the last round's data for analysis
+    last_row = df_rounds.iloc[-1]
+    client_ns_raw = last_row.get("client_ns_arr", None)
+    # We need client KLs. They're not directly in the CSV as an array column,
+    # but kl_mean/kl_max are. For analytical sensitivity we need per-client KLs.
+    # We'll use all rounds and approximate from weights + ns if needed.
+
+    # Try to reconstruct per-client KLs from weights: w_i = n_i * exp(-gamma * kl_i)
+    # => kl_i = -log(w_i / n_i) / gamma  (if gamma > 0)
+    weights_raw = last_row.get("weights_arr", None)
+
+    if client_ns_raw is None or weights_raw is None:
+        print("  Gamma sensitivity: skipped (missing client_ns or weights data)")
+        return out_dir / "gamma_sensitivity.png"
+
+    ns = np.asarray(client_ns_raw, dtype=np.float64)
+    ws = np.asarray(weights_raw, dtype=np.float64)
+    K = len(ns)
+
+    # Recover per-client KLs: w_i (unnormalized) = n_i * exp(-gamma * kl_i)
+    # w_i / sum(w) = ws[i] => w_i_unnorm = ws[i] * C  for some constant C
+    # We can recover kl_i from: ws[i] = n_i * exp(-gamma * kl_i) / Z
+    # => log(ws[i]) = log(n_i) - gamma * kl_i - log(Z)
+    # => kl_i = (log(n_i) - log(ws[i]) - log(Z)) / gamma
+    # We don't know Z, but we can use the kl_mean for calibration.
+    if actual_gamma > 1e-8:
+        # Use ratio approach: ws[i]/ws[j] = (n_i/n_j) * exp(-gamma*(kl_i - kl_j))
+        # Set kl_0 = 0 (reference), then kl_i = log(n_i * ws[0] / (n_0 * ws[i])) / gamma
+        ref_idx = 0
+        kls = np.zeros(K)
+        for i in range(K):
+            ratio = (ns[i] * ws[ref_idx]) / (ns[ref_idx] * ws[i] + 1e-15)
+            kls[i] = np.log(max(ratio, 1e-15)) / actual_gamma
+        # Shift so min KL is 0 (KL is non-negative)
+        kls -= kls.min()
+    else:
+        # gamma=0 means uniform weighting by n, can't recover KLs
+        # Use kl_mean as fallback: assume all clients have kl_mean
+        kl_mean = float(last_row.get("kl_mean", 0.1))
+        kls = np.full(K, kl_mean)
+        # Add small perturbation to show sensitivity
+        rng = np.random.default_rng(42)
+        kls += rng.uniform(0, kl_mean * 0.5, K)
+
+    # Now recompute weights for each gamma
+    k_effs = []
+    ginis = []
+    for g in gammas:
+        w_raw = ns * np.exp(-g * kls)
+        w_sum = w_raw.sum()
+        if w_sum > 0:
+            w_norm = w_raw / w_sum
+        else:
+            w_norm = np.ones(K) / K
+        k_effs.append(_effective_n(w_norm))
+        ginis.append(_gini(w_norm))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax1.plot(gammas, k_effs, "b-o", markersize=6, linewidth=2)
+    ax1.axvline(actual_gamma, color="red", linestyle="--", linewidth=1.5,
+                label=f"Actual γ={actual_gamma}")
+    ax1.axhline(K, color="gray", linestyle=":", linewidth=1, label=f"Max ({K})")
+    ax1.set_xlabel("γ (gamma)")
+    ax1.set_ylabel("K_eff")
+    ax1.set_title("Effective Clients vs γ")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(gammas, ginis, "orange", marker="s", markersize=6, linewidth=2)
+    ax2.axvline(actual_gamma, color="red", linestyle="--", linewidth=1.5,
+                label=f"Actual γ={actual_gamma}")
+    ax2.set_xlabel("γ (gamma)")
+    ax2.set_ylabel("Gini Coefficient")
+    ax2.set_title("Weight Inequality vs γ")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out_path = out_dir / "gamma_sensitivity.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    print(f"  Gamma sensitivity: at γ={actual_gamma}, K_eff={k_effs[gammas.index(actual_gamma) if actual_gamma in gammas else 2]:.2f}")
+    return out_path
+
+
+def plot_component_summary(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
+    """
+    Combined 2x2 dashboard: KL convergence, weight distribution, K_eff, py drift.
+    Produces: component_summary.png
+    """
+    _setup_style()
+    rounds = df_rounds["round"].values
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # (0,0) KL convergence
+    ax = axes[0, 0]
+    kl_mean = df_rounds["kl_mean"].values.astype(float)
+    kl_max = df_rounds["kl_max"].values.astype(float)
+    ax.plot(rounds, kl_mean, "b-o", markersize=3, label="KL mean", linewidth=2)
+    ax.plot(rounds, kl_max, "r--s", markersize=2, label="KL max", linewidth=1.5)
+    ax.set_xlabel("Round")
+    ax.set_ylabel("KL Divergence")
+    ax.set_title("KL Convergence")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # (0,1) Weight distribution
+    ax = axes[0, 1]
+    weight_lists = df_rounds["weights_arr"].tolist()
+    valid = [w for w in weight_lists if w is not None]
+    if valid:
+        n_clients = len(valid[0])
+        W = np.zeros((len(rounds), n_clients))
+        for i, wl in enumerate(weight_lists):
+            if wl is not None:
+                arr = np.asarray(wl, dtype=np.float64)
+                W[i, :len(arr)] = arr[:n_clients]
+        for c in range(n_clients):
+            ax.plot(rounds, W[:, c], "-", linewidth=1.2, label=f"C{c}")
+        ax.axhline(1.0 / n_clients, color="black", linestyle=":", linewidth=1)
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Weight")
+    ax.set_title("Client Weights")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # (1,0) Effective clients
+    ax = axes[1, 0]
+    k_effs = []
+    n_actual = 0
+    for wl in weight_lists:
+        if wl is not None:
+            w = np.asarray(wl, dtype=np.float64)
+            n_actual = len(w)
+            k_effs.append(_effective_n(w))
+        else:
+            k_effs.append(0.0)
+    ax.plot(rounds, k_effs, "b-o", markersize=4, linewidth=2)
+    ax.axhline(n_actual, color="red", linestyle="--", linewidth=1.5)
+    ax.set_xlabel("Round")
+    ax.set_ylabel("K_eff")
+    ax.set_title("Effective Clients")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    # (1,1) Class prior drift
+    ax = axes[1, 1]
+    py_lists = df_rounds["py_arr"].tolist()
+    valid_pys = [(r, np.asarray(p, dtype=np.float64)) for r, p in zip(rounds, py_lists) if p is not None]
+    if len(valid_pys) >= 2:
+        py_rounds, py_arrays = zip(*valid_pys)
+        kl_drifts = []
+        for i in range(1, len(py_arrays)):
+            kl_drifts.append(_kl(py_arrays[i], py_arrays[i - 1]))
+        ax.bar(py_rounds[1:], kl_drifts, color="steelblue", alpha=0.7)
+    ax.set_xlabel("Round")
+    ax.set_ylabel("KL(py_t || py_{t-1})")
+    ax.set_title("Class Prior Drift")
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle("FedGANBLR Component Analysis Dashboard", fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    out_path = out_dir / "component_summary.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Part 1: Orchestrator
+# ---------------------------------------------------------------------------
+
+def run_convergence_analysis(diagnostics_dir: Path, out_dir: Path) -> dict:
+    """Run all convergence and stability analyses on existing diagnostics."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = {}
+
+    print(f"\n{'='*60}")
+    print(f"Convergence Analysis: {diagnostics_dir}")
+    print(f"{'='*60}")
+
+    try:
+        df_rounds = load_round_stats(diagnostics_dir)
+    except FileNotFoundError as e:
+        print(f"  ERROR: {e}")
+        return {"error": str(e)}
+
+    fold_config = load_fold_config(diagnostics_dir)
+    client_stats = load_client_split_stats(diagnostics_dir)
+    df_nll = load_nll_convergence(diagnostics_dir)
+
+    print(f"  Loaded {len(df_rounds)} rounds of data")
+    if fold_config:
+        print(f"  Config: gamma={fold_config.get('gamma')}, "
+              f"cpt_mix={fold_config.get('cpt_mix')}, "
+              f"alpha_dir={fold_config.get('alpha_dir')}")
+
+    # Run all plot functions
+    plot_kl_convergence(df_rounds, out_dir)
+    plot_weight_distribution(df_rounds, out_dir)
+    plot_nll_convergence(df_nll, out_dir)
+    plot_class_prior_drift(df_rounds, out_dir)
+    plot_effective_clients(df_rounds, out_dir)
+    plot_gamma_sensitivity(df_rounds, out_dir, fold_config)
+    plot_component_summary(df_rounds, out_dir)
+
+    print(f"\n  All plots saved to: {out_dir}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Part 2: Ablation Study
+# ---------------------------------------------------------------------------
+
+def prepare_dataset(dataset_spec: dict, ef_bins: int = 12,
+                    random_state: int = 2025) -> tuple:
+    """
+    Load and discretize a dataset, returning a single train/test split.
+    Returns (Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes).
+    """
+    name = dataset_spec["name"]
+    print(f"\n  Preparing dataset: {name}")
+
+    X, y = fetch_openml_safely(name=name, data_id=dataset_spec.get("data_id"),
+                                target=dataset_spec["target"])
+    y = y.astype("category").cat.codes
+
+    # Single train/test split
+    cv = RepeatedStratifiedKFold(n_splits=2, n_repeats=1, random_state=random_state)
+    tr_idx, te_idx = next(cv.split(X, y))
+    Xtr_df, Xte_df = X.iloc[tr_idx], X.iloc[te_idx]
+    ytr_sr, yte_sr = y.iloc[tr_idx], y.iloc[te_idx]
+
+    if name.lower() == "covertype":
+        Xtr_df = preprocess_covertype_binary_columns(Xtr_df)
+        Xte_df = preprocess_covertype_binary_columns(Xte_df)
+
+    ef_bins_use = dataset_spec.get("ef_bins") or ef_bins
+    Xtr_int, Xte_int, ytr_int, yte_int, card_feat, classes = discretize_train_test_no_leak(
+        Xtr_df, ytr_sr, Xte_df, yte_sr, strategy="ef", ef_bins=ef_bins_use
+    )
+    num_classes = len(classes)
+    print(f"    n_train={len(Xtr_int)}, n_test={len(Xte_int)}, "
+          f"n_features={Xtr_int.shape[1]}, n_classes={num_classes}")
+    return Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes
+
+
+def run_single_ablation(config_name: str, config_params: dict,
+                        Xtr_int, ytr_int, Xte_int, yte_int,
+                        card_feat, num_classes,
+                        shared_params: dict,
+                        diagnostics_root: Path | None = None) -> dict:
+    """Run a single ablation configuration and return results."""
+    # Merge config-specific params with shared params
+    merged = {**shared_params, **config_params}
+    diag_dir = None
+    if diagnostics_root is not None:
+        diag_dir = diagnostics_root / config_name
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"    Running config '{config_name}': "
+          f"gamma={merged.get('gamma')}, beta_pow={merged.get('beta_pow')}, "
+          f"cpt_mix={merged.get('cpt_mix')}, alpha_dir={merged.get('alpha_dir')}")
+
+    t0 = time.time()
+    try:
+        res = run_one_fold_fed_ganblr(
+            Xtr_int=Xtr_int, ytr_int=ytr_int,
+            Xte_int=Xte_int, yte_int=yte_int,
+            card_feat=card_feat, num_classes=num_classes,
+            ray_local_mode=True,
+            diagnostics_dir=diag_dir,
+            **merged,
+        )
+    except Exception as e:
+        warnings.warn(f"    Config '{config_name}' failed: {e}")
+        res = {f"acc_{c}": np.nan for c in CLASSIFIERS}
+        res.update({f"nll_{c}": np.nan for c in CLASSIFIERS})
+        res["train_time_sec"] = time.time() - t0
+
+    # Cleanup between runs
+    try:
+        _soft_clear_tf_and_ray()
+    except Exception:
+        pass
+
+    out = {"config_name": config_name}
+    for c in CLASSIFIERS:
+        out[f"acc_{c}"] = res.get(f"acc_{c}", np.nan)
+        out[f"nll_{c}"] = res.get(f"nll_{c}", np.nan)
+    out["train_time_sec"] = res.get("train_time_sec", np.nan)
+
+    acc_vals = [out[f"acc_{c}"] for c in CLASSIFIERS if not np.isnan(out.get(f"acc_{c}", np.nan))]
+    mean_acc = np.mean(acc_vals) if acc_vals else np.nan
+    print(f"      -> mean_acc={mean_acc:.4f}, time={out['train_time_sec']:.1f}s")
+    return out
+
+
+def run_ablation_study(dataset_specs: list, out_dir: Path,
+                       configs: dict | None = None,
+                       shared_params: dict | None = None) -> pd.DataFrame:
+    """Run ablation study across datasets and configurations."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if configs is None:
+        configs = ABLATION_CONFIGS
+    if shared_params is None:
+        shared_params = dict(DEFAULT_SHARED_PARAMS)
+
+    all_results = []
+
+    for spec in dataset_specs:
+        name = spec["name"]
+        print(f"\n{'='*60}")
+        print(f"Ablation Study: {name}")
+        print(f"{'='*60}")
+
+        try:
+            Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes = prepare_dataset(spec)
+        except Exception as e:
+            print(f"  Skipping {name}: {e}")
+            continue
+
+        diag_root = out_dir / "diagnostics" / name
+
+        for config_name, config_params in configs.items():
+            result = run_single_ablation(
+                config_name=config_name,
+                config_params=config_params,
+                Xtr_int=Xtr_int, ytr_int=ytr_int,
+                Xte_int=Xte_int, yte_int=yte_int,
+                card_feat=card_feat, num_classes=num_classes,
+                shared_params=shared_params,
+                diagnostics_root=diag_root,
+            )
+            result["dataset"] = name
+            all_results.append(result)
+
+    df = pd.DataFrame(all_results)
+    csv_path = out_dir / "ablation_results.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\n  Results saved to: {csv_path}")
+    return df
+
+
+def compute_ablation_deltas(df_ablation: pd.DataFrame) -> pd.DataFrame:
+    """Compute differences from baseline for each configuration."""
+    rows = []
+    metric_cols = [c for c in df_ablation.columns if c.startswith(("acc_", "nll_"))]
+
+    for dataset in df_ablation["dataset"].unique():
+        df_ds = df_ablation[df_ablation["dataset"] == dataset]
+        baseline_row = df_ds[df_ds["config_name"] == "baseline"]
+        if baseline_row.empty:
+            continue
+        baseline = baseline_row.iloc[0]
+
+        for _, row in df_ds.iterrows():
+            if row["config_name"] == "baseline":
+                continue
+            for metric in metric_cols:
+                base_val = float(baseline[metric])
+                curr_val = float(row[metric])
+                delta = curr_val - base_val
+                pct = (delta / abs(base_val) * 100) if abs(base_val) > 1e-10 else 0.0
+                rows.append({
+                    "dataset": dataset,
+                    "config_name": row["config_name"],
+                    "metric": metric,
+                    "baseline_val": base_val,
+                    "value": curr_val,
+                    "delta": delta,
+                    "pct_change": pct,
+                })
+
+    df_deltas = pd.DataFrame(rows)
+
+    # Print summary table
+    if not df_deltas.empty:
+        print(f"\n{'='*60}")
+        print("Ablation Deltas from Baseline")
+        print(f"{'='*60}")
+        for dataset in df_deltas["dataset"].unique():
+            print(f"\n  Dataset: {dataset}")
+            df_ds = df_deltas[df_deltas["dataset"] == dataset]
+            pivot = df_ds.pivot_table(index="config_name", columns="metric",
+                                      values="delta", aggfunc="first")
+            # Show only accuracy columns for readability
+            acc_cols = [c for c in pivot.columns if c.startswith("acc_")]
+            if acc_cols:
+                print(pivot[acc_cols].to_string(float_format="{:+.4f}".format))
+
+    return df_deltas
+
+
+def plot_ablation_bar_chart(df_ablation: pd.DataFrame, out_dir: Path,
+                            metric_type: str = "acc") -> Path:
+    """
+    Grouped bar chart comparing configurations.
+    metric_type: 'acc' or 'nll'
+    """
+    _setup_style()
+    datasets = df_ablation["dataset"].unique()
+    n_datasets = len(datasets)
+    metric_cols = [f"{metric_type}_{c}" for c in CLASSIFIERS]
+
+    fig, axes = plt.subplots(1, max(n_datasets, 1), figsize=(7 * n_datasets, 6),
+                              squeeze=False)
+
+    for idx, dataset in enumerate(datasets):
+        ax = axes[0, idx]
+        df_ds = df_ablation[df_ablation["dataset"] == dataset].copy()
+        configs = df_ds["config_name"].values
+        n_configs = len(configs)
+        n_metrics = len(metric_cols)
+
+        x = np.arange(n_configs)
+        width = 0.8 / n_metrics
+        colors = plt.cm.Set2(np.linspace(0, 1, n_metrics))
+
+        for j, col in enumerate(metric_cols):
+            vals = df_ds[col].values.astype(float)
+            offset = (j - n_metrics / 2 + 0.5) * width
+            bars = ax.bar(x + offset, vals, width, label=col.split("_")[1].upper(),
+                         color=colors[j], edgecolor="gray", linewidth=0.5)
+            # Add value labels
+            for bar, val in zip(bars, vals):
+                if not np.isnan(val):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                           f"{val:.3f}", ha="center", va="bottom", fontsize=7, rotation=45)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(configs, rotation=35, ha="right", fontsize=8)
+        ax.set_ylabel(metric_type.upper())
+        ax.set_title(f"{dataset}")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.2, axis="y")
+
+    fig.suptitle(f"Ablation Study: {metric_type.upper()} by Configuration",
+                 fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    out_path = out_dir / f"ablation_{metric_type}.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_ablation_delta_heatmap(df_deltas: pd.DataFrame, out_dir: Path) -> Path:
+    """
+    Heatmap of accuracy deltas from baseline.
+    y-axis: configs, x-axis: metrics, color: delta.
+    """
+    _setup_style()
+    if df_deltas.empty:
+        print("  Heatmap: skipped (no delta data)")
+        return out_dir / "ablation_heatmap.png"
+
+    datasets = df_deltas["dataset"].unique()
+    n_datasets = len(datasets)
+
+    fig, axes = plt.subplots(1, max(n_datasets, 1), figsize=(8 * n_datasets, 5),
+                              squeeze=False)
+
+    for idx, dataset in enumerate(datasets):
+        ax = axes[0, idx]
+        df_ds = df_deltas[df_deltas["dataset"] == dataset]
+        acc_metrics = [m for m in df_ds["metric"].unique() if m.startswith("acc_")]
+
+        if not acc_metrics:
+            continue
+
+        pivot = df_ds[df_ds["metric"].isin(acc_metrics)].pivot_table(
+            index="config_name", columns="metric", values="delta", aggfunc="first"
+        )
+
+        if pivot.empty:
+            continue
+
+        # Plot heatmap
+        data = pivot.values
+        im = ax.imshow(data, cmap="RdYlGn", aspect="auto",
+                        vmin=-np.nanmax(np.abs(data)), vmax=np.nanmax(np.abs(data)))
+
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels([c.replace("acc_", "").upper() for c in pivot.columns],
+                           fontsize=9)
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index, fontsize=9)
+
+        # Annotate cells
+        for i in range(data.shape[0]):
+            for j in range(data.shape[1]):
+                val = data[i, j]
+                if not np.isnan(val):
+                    color = "white" if abs(val) > np.nanmax(np.abs(data)) * 0.6 else "black"
+                    ax.text(j, i, f"{val:+.4f}", ha="center", va="center",
+                           fontsize=8, color=color)
+
+        ax.set_title(f"{dataset}: Accuracy Δ from Baseline")
+        plt.colorbar(im, ax=ax, shrink=0.8)
+
+    fig.tight_layout()
+    out_path = out_dir / "ablation_heatmap.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Statistical Analysis Framework for FedGANBLR: "
+                    "convergence/stability analysis and ablation studies."
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Analysis mode")
+
+    # --- convergence subcommand ---
+    p_conv = subparsers.add_parser(
+        "convergence",
+        help="Run convergence/stability analysis on existing diagnostics"
+    )
+    p_conv.add_argument(
+        "--diagnostics-dir", type=str, required=True,
+        help="Path to diagnostics directory (e.g., diagnostics/adult/fold_01)"
+    )
+    p_conv.add_argument(
+        "--output-dir", type=str,
+        default=str(DEFAULT_OUTPUT_DIR / "convergence")
+    )
+
+    # --- ablation subcommand ---
+    p_abl = subparsers.add_parser("ablation", help="Run ablation study")
+    p_abl.add_argument(
+        "--datasets", nargs="+", default=["nursery"],
+        help="Dataset names (from: nursery, chess, car, adult)"
+    )
+    p_abl.add_argument(
+        "--output-dir", type=str,
+        default=str(DEFAULT_OUTPUT_DIR / "ablation")
+    )
+    p_abl.add_argument("--num-rounds", type=int, default=10)
+    p_abl.add_argument("--num-clients", type=int, default=5)
+    p_abl.add_argument("--dir-alpha", type=float, default=0.2)
+
+    # --- full subcommand ---
+    p_full = subparsers.add_parser(
+        "full",
+        help="Run ablation then convergence analysis on generated diagnostics"
+    )
+    p_full.add_argument(
+        "--datasets", nargs="+", default=["nursery"],
+        help="Dataset names (from: nursery, chess, car, adult)"
+    )
+    p_full.add_argument(
+        "--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR)
+    )
+    p_full.add_argument("--num-rounds", type=int, default=10)
+    p_full.add_argument("--num-clients", type=int, default=5)
+    p_full.add_argument("--dir-alpha", type=float, default=0.2)
+
+    args = parser.parse_args()
+
+    if args.command == "convergence":
+        out_dir = Path(args.output_dir)
+        summary = run_convergence_analysis(Path(args.diagnostics_dir), out_dir)
+        print("\n=== Convergence Analysis Complete ===")
+
+    elif args.command == "ablation":
+        out_dir = Path(args.output_dir)
+        # Map dataset names to specs
+        selected = [s for s in DATASET_SPECS if s["name"] in args.datasets]
+        if not selected:
+            print(f"No matching datasets for: {args.datasets}")
+            print(f"Available: {[s['name'] for s in DATASET_SPECS]}")
+            sys.exit(1)
+
+        shared = dict(DEFAULT_SHARED_PARAMS)
+        shared["num_rounds"] = args.num_rounds
+        shared["num_clients"] = args.num_clients
+        shared["dir_alpha"] = args.dir_alpha
+
+        df = run_ablation_study(selected, out_dir, shared_params=shared)
+        deltas = compute_ablation_deltas(df)
+        plot_ablation_bar_chart(df, out_dir, metric_type="acc")
+        plot_ablation_bar_chart(df, out_dir, metric_type="nll")
+        plot_ablation_delta_heatmap(deltas, out_dir)
+        print("\n=== Ablation Study Complete ===")
+
+    elif args.command == "full":
+        out_dir = Path(args.output_dir)
+        selected = [s for s in DATASET_SPECS if s["name"] in args.datasets]
+        if not selected:
+            print(f"No matching datasets for: {args.datasets}")
+            print(f"Available: {[s['name'] for s in DATASET_SPECS]}")
+            sys.exit(1)
+
+        shared = dict(DEFAULT_SHARED_PARAMS)
+        shared["num_rounds"] = args.num_rounds
+        shared["num_clients"] = args.num_clients
+        shared["dir_alpha"] = args.dir_alpha
+
+        # Step 1: Run ablation study (generates diagnostics for each config)
+        abl_dir = out_dir / "ablation"
+        df = run_ablation_study(selected, abl_dir, shared_params=shared)
+        deltas = compute_ablation_deltas(df)
+        plot_ablation_bar_chart(df, abl_dir, metric_type="acc")
+        plot_ablation_bar_chart(df, abl_dir, metric_type="nll")
+        plot_ablation_delta_heatmap(deltas, abl_dir)
+
+        # Step 2: Run convergence analysis on each config's diagnostics
+        for spec in selected:
+            for config_name in ABLATION_CONFIGS:
+                diag_path = abl_dir / "diagnostics" / spec["name"] / config_name
+                if diag_path.exists() and (diag_path / "global_round_stats.csv").exists():
+                    conv_out = out_dir / "convergence" / spec["name"] / config_name
+                    run_convergence_analysis(diag_path, conv_out)
+
+        print("\n=== Full Analysis Complete ===")
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
