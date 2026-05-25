@@ -123,7 +123,6 @@ def _setup_style():
         "legend.fontsize": 9,
         "figure.dpi": 150,
         "savefig.dpi": 150,
-        "savefig.bbox_inches": "tight",
     })
 
 
@@ -217,7 +216,7 @@ def plot_kl_convergence(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
         ax2.legend(loc="upper right")
 
     out_path = out_dir / "kl_convergence.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
     print(f"  KL Convergence: final_kl_mean={kl_mean[-1]:.4f}, "
@@ -280,7 +279,7 @@ def plot_weight_distribution(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
 
     fig.tight_layout()
     out_path = out_dir / "weight_distribution.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
     max_swing = float(np.max(np.abs(np.diff(W, axis=0)))) if W.shape[0] > 1 else 0.0
@@ -323,7 +322,7 @@ def plot_nll_convergence(df_nll: pd.DataFrame | None, out_dir: Path) -> Path | N
     ax.grid(True, alpha=0.3)
 
     out_path = out_dir / "nll_convergence.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
     final_nlls = pivot.iloc[-1].values
@@ -378,7 +377,7 @@ def plot_class_prior_drift(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
 
     fig.tight_layout()
     out_path = out_dir / "class_prior_drift.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
     total_drift = sum(kl_drifts)
@@ -419,7 +418,7 @@ def plot_effective_clients(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
     ax.set_ylim(bottom=0)
 
     out_path = out_dir / "effective_clients.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
     print(f"  Effective clients: final={k_effs[-1]:.2f}/{n_actual}, "
@@ -518,7 +517,7 @@ def plot_gamma_sensitivity(df_rounds: pd.DataFrame, out_dir: Path,
 
     fig.tight_layout()
     out_path = out_dir / "gamma_sensitivity.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
     print(f"  Gamma sensitivity: at γ={actual_gamma}, K_eff={k_effs[gammas.index(actual_gamma) if actual_gamma in gammas else 2]:.2f}")
@@ -604,7 +603,7 @@ def plot_component_summary(df_rounds: pd.DataFrame, out_dir: Path) -> Path:
     fig.suptitle("FedGANBLR Component Analysis Dashboard", fontsize=14, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     out_path = out_dir / "component_summary.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -882,7 +881,7 @@ def plot_ablation_bar_chart(df_ablation: pd.DataFrame, out_dir: Path,
                  fontsize=14, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     out_path = out_dir / f"ablation_{metric_type}.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -943,7 +942,7 @@ def plot_ablation_delta_heatmap(df_deltas: pd.DataFrame, out_dir: Path) -> Path:
 
     fig.tight_layout()
     out_path = out_dir / "ablation_heatmap.png"
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
