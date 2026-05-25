@@ -60,17 +60,7 @@ DATASET_SPECS = [
     dict(name="chess",                data_id=23,  target="class", ef_bins=None),
     dict(name="car",                  data_id=19,  target="class", ef_bins=None),
     dict(name="adult",                data_id=2,   target="class", ef_bins=None),
-    dict(name="letter-recognition",   data_id=59,  target="class", ef_bins=None),
-    dict(name="Covertype",            data_id=31,  target="class", ef_bins=None),
-    dict(name="Satellite",            data_id=146, target="class", ef_bins=None),
-    dict(name="pokerhand",            data_id=158, target="class", ef_bins=None),
-    dict(name="HTRU2",                data_id=372, target="class", ef_bins=None),
-    dict(name="magic",                data_id=159, target="class", ef_bins=None),
-    dict(name="shuttle",              data_id=148, target="class", ef_bins=None),
-    dict(name="connect-4",            data_id=26,  target="class", ef_bins=None),
-    dict(name="bank-marketing",       data_id=222, target="class", ef_bins=None),
-    dict(name="census-income-kdd",    data_id=117, target="class", ef_bins=None),
-    dict(name="spambase",             data_id=94,  target="class", ef_bins=None),
+
 ]
 
 CLASSIFIERS = ["lr", "mlp", "rf", "xgb"]
@@ -998,6 +988,20 @@ def main():
     p_abl.add_argument("--num-clients", type=int, default=5)
     p_abl.add_argument("--dir-alpha", type=float, default=0.2)
 
+    # --- charts subcommand ---
+    p_charts = subparsers.add_parser(
+        "charts",
+        help="Generate charts from an existing ablation_results.csv (no retraining)"
+    )
+    p_charts.add_argument(
+        "--csv", type=str, required=True,
+        help="Path to ablation_results.csv"
+    )
+    p_charts.add_argument(
+        "--output-dir", type=str,
+        default=str(DEFAULT_OUTPUT_DIR / "charts")
+    )
+
     # --- full subcommand ---
     p_full = subparsers.add_parser(
         "full",
@@ -1020,6 +1024,24 @@ def main():
         out_dir = Path(args.output_dir)
         summary = run_convergence_analysis(Path(args.diagnostics_dir), out_dir)
         print("\n=== Convergence Analysis Complete ===")
+
+    elif args.command == "charts":
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = Path(args.csv)
+        if not csv_path.exists():
+            print(f"CSV not found: {csv_path}")
+            sys.exit(1)
+        df = pd.read_csv(csv_path)
+        print(f"Loaded {len(df)} rows from {csv_path}")
+        print(f"Datasets: {df['dataset'].unique().tolist()}")
+        print(f"Configs:  {df['config_name'].unique().tolist()}")
+        deltas = compute_ablation_deltas(df)
+        plot_ablation_bar_chart(df, out_dir, metric_type="acc")
+        plot_ablation_bar_chart(df, out_dir, metric_type="nll")
+        plot_ablation_delta_heatmap(deltas, out_dir)
+        print(f"\nCharts saved to: {out_dir}")
+        print("=== Charts Complete ===")
 
     elif args.command == "ablation":
         out_dir = Path(args.output_dir)
