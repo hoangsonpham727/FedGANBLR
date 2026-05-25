@@ -37,8 +37,10 @@ from utils import (
     fetch_openml_safely,
     discretize_train_test_no_leak,
     preprocess_covertype_binary_columns,
+    _evaluate_synthetic_classifiers,
 )
-from federated_models.FedGanblr import _kl
+from federated_models.FedGanblr import _kl, build_global_kdb_from_gm
+from base_models.KDependenceBayesian import MLE_KDB
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,7 +62,6 @@ DATASET_SPECS = [
     dict(name="chess",                data_id=23,  target="class", ef_bins=None),
     dict(name="car",                  data_id=19,  target="class", ef_bins=None),
     dict(name="adult",                data_id=2,   target="class", ef_bins=None),
-
 ]
 
 CLASSIFIERS = ["lr", "mlp", "rf", "xgb"]
@@ -949,6 +950,129 @@ def plot_ablation_delta_heatmap(df_deltas: pd.DataFrame, out_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Reconstruct ablation_results.csv from diagnostics directories
+# ---------------------------------------------------------------------------
+
+def reconstruct_from_diagnostics(diagnostics_root: Path, out_dir: Path,
+                                  eval_syn_frac: float = 0.5) -> pd.DataFrame:
+    """
+    Walk diagnostics_root/{dataset}/{config}/final_global_model.json,
+    regenerate synthetic data from each saved model, evaluate TSTR metrics,
+    and write ablation_results.csv — without rerunning any training.
+
+    Expected directory layout (produced by run_ablation_study):
+        diagnostics_root/
+          {dataset_name}/
+            {config_name}/
+              final_global_model.json
+              fold_config.json          (optional, for metadata)
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Discover all (dataset, config) pairs present on disk
+    pairs = []
+    for ds_dir in sorted(diagnostics_root.iterdir()):
+        if not ds_dir.is_dir():
+            continue
+        for cfg_dir in sorted(ds_dir.iterdir()):
+            if not cfg_dir.is_dir():
+                continue
+            model_path = cfg_dir / "final_global_model.json"
+            if model_path.exists():
+                pairs.append((ds_dir.name, cfg_dir.name, cfg_dir))
+
+    if not pairs:
+        print(f"No final_global_model.json files found under {diagnostics_root}")
+        return pd.DataFrame()
+
+    print(f"\nFound {len(pairs)} (dataset, config) pairs to reconstruct:")
+    for ds, cfg, _ in pairs:
+        print(f"  {ds} / {cfg}")
+
+    # Cache fetched datasets so each dataset is only downloaded once
+    dataset_cache: dict[str, tuple] = {}
+
+    all_results = []
+    for dataset_name, config_name, cfg_dir in pairs:
+        print(f"\n{'='*60}")
+        print(f"Reconstructing: {dataset_name} / {config_name}")
+        print(f"{'='*60}")
+
+        # --- Load final global model ---
+        try:
+            raw = json.loads((cfg_dir / "final_global_model.json").read_text())
+            py      = np.asarray(raw["py"], dtype=np.float64)
+            thetas  = {int(v): np.asarray(t, dtype=np.float64)
+                       for v, t in raw["thetas"].items()}
+            card    = list(map(int, raw["card"]))
+            y_index = int(raw["y_index"])
+            parents = {int(k): list(map(int, v))
+                       for k, v in raw["parents"].items()}
+        except Exception as e:
+            print(f"  Skipping — could not load model: {e}")
+            continue
+
+        # --- Fetch & discretize real data (cached per dataset) ---
+        if dataset_name not in dataset_cache:
+            spec = next((s for s in DATASET_SPECS if s["name"] == dataset_name), None)
+            if spec is None:
+                print(f"  Skipping — '{dataset_name}' not in DATASET_SPECS")
+                continue
+            try:
+                data_tuple = prepare_dataset(spec)
+                dataset_cache[dataset_name] = data_tuple
+            except Exception as e:
+                print(f"  Skipping — could not prepare dataset: {e}")
+                continue
+
+        Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes = dataset_cache[dataset_name]
+
+        # --- Rebuild MLE_KDB from saved parameters ---
+        try:
+            gm = {"py": py, "thetas": thetas}
+            gen = build_global_kdb_from_gm(gm, card, parents, y_index)
+        except Exception as e:
+            print(f"  Skipping — could not rebuild model: {e}")
+            continue
+
+        # --- Generate synthetic data ---
+        try:
+            n_syn = max(1, int(len(Xtr_int) * eval_syn_frac))
+            syn_full = gen.sample(n=n_syn, rng=np.random.default_rng(0),
+                                  order=None, return_y=True)
+            X_syn = syn_full[:, [i for i in range(syn_full.shape[1]) if i != y_index]]
+            y_syn = syn_full[:, y_index]
+            print(f"  Generated {n_syn} synthetic samples")
+        except Exception as e:
+            print(f"  Skipping — synthetic generation failed: {e}")
+            continue
+
+        # --- Evaluate TSTR ---
+        try:
+            ev = _evaluate_synthetic_classifiers(X_syn, y_syn, Xte_int, yte_int)
+        except Exception as e:
+            print(f"  Warning — evaluation failed: {e}")
+            ev = {f"acc_{c}": np.nan for c in CLASSIFIERS}
+            ev.update({f"nll_{c}": np.nan for c in CLASSIFIERS})
+
+        row = {"dataset": dataset_name, "config_name": config_name}
+        row.update(ev)
+        row["train_time_sec"] = np.nan   # not available post-hoc
+
+        acc_vals = [ev.get(f"acc_{c}", np.nan) for c in CLASSIFIERS]
+        mean_acc = np.nanmean([v for v in acc_vals if not np.isnan(v)]) if acc_vals else np.nan
+        print(f"  mean_acc={mean_acc:.4f}  "
+              + "  ".join(f"acc_{c}={ev.get(f'acc_{c}', np.nan):.4f}" for c in CLASSIFIERS))
+        all_results.append(row)
+
+    df = pd.DataFrame(all_results)
+    csv_path = out_dir / "ablation_results.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\n  Saved {len(df)} rows → {csv_path}")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
@@ -988,6 +1112,25 @@ def main():
     p_abl.add_argument("--num-clients", type=int, default=5)
     p_abl.add_argument("--dir-alpha", type=float, default=0.2)
 
+    # --- reconstruct subcommand ---
+    p_rec = subparsers.add_parser(
+        "reconstruct",
+        help="Rebuild ablation_results.csv from saved diagnostics, then generate charts"
+    )
+    p_rec.add_argument(
+        "--diagnostics-dir", type=str, required=True,
+        help="Root diagnostics directory, e.g. analysis_output/ablation/diagnostics"
+    )
+    p_rec.add_argument(
+        "--output-dir", type=str,
+        default=str(DEFAULT_OUTPUT_DIR / "ablation"),
+        help="Where to write ablation_results.csv and chart PNGs"
+    )
+    p_rec.add_argument(
+        "--eval-syn-frac", type=float, default=0.5,
+        help="Fraction of training size to sample for synthetic evaluation (default: 0.5)"
+    )
+
     # --- charts subcommand ---
     p_charts = subparsers.add_parser(
         "charts",
@@ -1024,6 +1167,24 @@ def main():
         out_dir = Path(args.output_dir)
         summary = run_convergence_analysis(Path(args.diagnostics_dir), out_dir)
         print("\n=== Convergence Analysis Complete ===")
+
+    elif args.command == "reconstruct":
+        out_dir = Path(args.output_dir)
+        diag_root = Path(args.diagnostics_dir)
+        if not diag_root.exists():
+            print(f"Diagnostics directory not found: {diag_root}")
+            sys.exit(1)
+        df = reconstruct_from_diagnostics(diag_root, out_dir,
+                                          eval_syn_frac=args.eval_syn_frac)
+        if df.empty:
+            print("No results to plot.")
+            sys.exit(1)
+        deltas = compute_ablation_deltas(df)
+        plot_ablation_bar_chart(df, out_dir, metric_type="acc")
+        plot_ablation_bar_chart(df, out_dir, metric_type="nll")
+        plot_ablation_delta_heatmap(deltas, out_dir)
+        print(f"\nCharts saved to: {out_dir}")
+        print("=== Reconstruct Complete ===")
 
     elif args.command == "charts":
         out_dir = Path(args.output_dir)
