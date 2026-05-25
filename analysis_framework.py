@@ -56,10 +56,21 @@ ABLATION_CONFIGS = {
 }
 
 DATASET_SPECS = [
-    dict(name="nursery", data_id=76,  target="class", ef_bins=None),
-    dict(name="chess",   data_id=23,  target="class", ef_bins=None),
-    dict(name="car",     data_id=19,  target="class", ef_bins=None),
-    dict(name="adult",   data_id=2,   target="class", ef_bins=None),
+    dict(name="nursery",              data_id=76,  target="class", ef_bins=None),
+    dict(name="chess",                data_id=23,  target="class", ef_bins=None),
+    dict(name="car",                  data_id=19,  target="class", ef_bins=None),
+    dict(name="adult",                data_id=2,   target="class", ef_bins=None),
+    dict(name="letter-recognition",   data_id=59,  target="class", ef_bins=None),
+    dict(name="Covertype",            data_id=31,  target="class", ef_bins=None),
+    dict(name="Satellite",            data_id=146, target="class", ef_bins=None),
+    dict(name="pokerhand",            data_id=158, target="class", ef_bins=None),
+    dict(name="HTRU2",                data_id=372, target="class", ef_bins=None),
+    dict(name="magic",                data_id=159, target="class", ef_bins=None),
+    dict(name="shuttle",              data_id=148, target="class", ef_bins=None),
+    dict(name="connect-4",            data_id=26,  target="class", ef_bins=None),
+    dict(name="bank-marketing",       data_id=222, target="class", ef_bins=None),
+    dict(name="census-income-kdd",    data_id=117, target="class", ef_bins=None),
+    dict(name="spambase",             data_id=94,  target="class", ef_bins=None),
 ]
 
 CLASSIFIERS = ["lr", "mlp", "rf", "xgb"]
@@ -973,10 +984,11 @@ def main():
     )
 
     # --- ablation subcommand ---
+    all_dataset_names = [s["name"] for s in DATASET_SPECS]
     p_abl = subparsers.add_parser("ablation", help="Run ablation study")
     p_abl.add_argument(
-        "--datasets", nargs="+", default=["nursery"],
-        help="Dataset names (from: nursery, chess, car, adult)"
+        "--datasets", nargs="+", default=all_dataset_names,
+        help=f"Dataset names (default: all — {', '.join(all_dataset_names)})"
     )
     p_abl.add_argument(
         "--output-dir", type=str,
@@ -992,8 +1004,8 @@ def main():
         help="Run ablation then convergence analysis on generated diagnostics"
     )
     p_full.add_argument(
-        "--datasets", nargs="+", default=["nursery"],
-        help="Dataset names (from: nursery, chess, car, adult)"
+        "--datasets", nargs="+", default=all_dataset_names,
+        help=f"Dataset names (default: all — {', '.join(all_dataset_names)})"
     )
     p_full.add_argument(
         "--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR)
