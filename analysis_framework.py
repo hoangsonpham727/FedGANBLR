@@ -33,6 +33,7 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 
 # --- Project imports (reuse existing functions, never reimplement) ---
 from evaluation import run_one_fold_fed_ganblr, _soft_clear_tf_and_ray
+from evaluation_fedstruct import run_one_fold_fed_ganblr_fedstruct
 from utils import (
     fetch_openml_safely,
     discretize_train_test_no_leak,
@@ -48,6 +49,7 @@ from base_models.KDependenceBayesian import MLE_KDB
 
 DEFAULT_OUTPUT_DIR = Path("analysis_output")
 
+# Ablation configs for FedGANBLR
 ABLATION_CONFIGS = {
     "baseline":              dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
     "no_kl_weighting":       dict(gamma=0.0,  beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
@@ -56,6 +58,21 @@ ABLATION_CONFIGS = {
     "no_smoothing":          dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.0),
     "kl_only":               dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0),
 }
+
+# Ablation configs for FedStruct — same component sweep, same parameter names
+# FedStruct adds a structure-learning round (round 1) on top of the parameter rounds,
+# so the same components apply; the structure round itself is always active.
+ABLATION_CONFIGS_FEDSTRUCT = {
+    "baseline":              dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
+    "no_kl_weighting":       dict(gamma=0.0,  beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
+    "no_importance_weights": dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.6, alpha_dir=0.01),
+    "no_cpt_mix":            dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.0, alpha_dir=0.01),
+    "no_smoothing":          dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.0),
+    "kl_only":               dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0),
+}
+
+# Map model name → (runner function, ablation configs, shared params)
+# Resolved at runtime after DEFAULT_SHARED_PARAMS_FEDSTRUCT is defined below.
 
 DATASET_SPECS = [
     dict(name="nursery",              data_id=76,  target="class", ef_bins=None),
@@ -77,6 +94,26 @@ DEFAULT_SHARED_PARAMS = dict(
     eval_syn_frac=0.5,
     cap_train=None,
 )
+
+# FedStruct uses the same parameters; num_rounds here = parameter-training rounds
+# (an extra structure-learning round is added automatically inside the runner).
+DEFAULT_SHARED_PARAMS_FEDSTRUCT = dict(
+    k_global=2,
+    num_clients=5,
+    num_rounds=10,
+    dir_alpha=0.2,
+    local_epochs=3,
+    batch_size=512,
+    disc_epochs=1,
+    eval_syn_frac=0.5,
+    cap_train=None,
+)
+
+# Registry: model name → (runner, ablation configs dict, default shared params)
+MODEL_REGISTRY = {
+    "fedganblr":  (run_one_fold_fed_ganblr,          ABLATION_CONFIGS,          DEFAULT_SHARED_PARAMS),
+    "fedstruct":  (run_one_fold_fed_ganblr_fedstruct, ABLATION_CONFIGS_FEDSTRUCT, DEFAULT_SHARED_PARAMS_FEDSTRUCT),
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -693,22 +730,24 @@ def run_single_ablation(config_name: str, config_params: dict,
                         Xtr_int, ytr_int, Xte_int, yte_int,
                         card_feat, num_classes,
                         shared_params: dict,
-                        diagnostics_root: Path | None = None) -> dict:
+                        diagnostics_root: Path | None = None,
+                        model: str = "fedganblr") -> dict:
     """Run a single ablation configuration and return results."""
-    # Merge config-specific params with shared params
+    runner, _, _ = MODEL_REGISTRY.get(model, MODEL_REGISTRY["fedganblr"])
+
     merged = {**shared_params, **config_params}
     diag_dir = None
     if diagnostics_root is not None:
         diag_dir = diagnostics_root / config_name
         diag_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"    Running config '{config_name}': "
+    print(f"    [{model}] config '{config_name}': "
           f"gamma={merged.get('gamma')}, beta_pow={merged.get('beta_pow')}, "
           f"cpt_mix={merged.get('cpt_mix')}, alpha_dir={merged.get('alpha_dir')}")
 
     t0 = time.time()
     try:
-        res = run_one_fold_fed_ganblr(
+        res = runner(
             Xtr_int=Xtr_int, ytr_int=ytr_int,
             Xte_int=Xte_int, yte_int=yte_int,
             card_feat=card_feat, num_classes=num_classes,
@@ -722,7 +761,6 @@ def run_single_ablation(config_name: str, config_params: dict,
         res.update({f"nll_{c}": np.nan for c in CLASSIFIERS})
         res["train_time_sec"] = time.time() - t0
 
-    # Cleanup between runs
     try:
         _soft_clear_tf_and_ray()
     except Exception:
@@ -742,20 +780,25 @@ def run_single_ablation(config_name: str, config_params: dict,
 
 def run_ablation_study(dataset_specs: list, out_dir: Path,
                        configs: dict | None = None,
-                       shared_params: dict | None = None) -> pd.DataFrame:
+                       shared_params: dict | None = None,
+                       model: str = "fedganblr") -> pd.DataFrame:
     """Run ablation study across datasets and configurations."""
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    _, default_configs, default_shared = MODEL_REGISTRY.get(model, MODEL_REGISTRY["fedganblr"])
     if configs is None:
-        configs = ABLATION_CONFIGS
+        configs = default_configs
     if shared_params is None:
-        shared_params = dict(DEFAULT_SHARED_PARAMS)
+        shared_params = dict(default_shared)
+
+    print(f"\n  Model: {model}  |  Configs: {list(configs.keys())}")
 
     all_results = []
 
     for spec in dataset_specs:
         name = spec["name"]
         print(f"\n{'='*60}")
-        print(f"Ablation Study: {name}")
+        print(f"Ablation Study [{model}]: {name}")
         print(f"{'='*60}")
 
         try:
@@ -775,6 +818,7 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
                 card_feat=card_feat, num_classes=num_classes,
                 shared_params=shared_params,
                 diagnostics_root=diag_root,
+                model=model,
             )
             result["dataset"] = name
             all_results.append(result)
@@ -1097,75 +1141,83 @@ def main():
         default=str(DEFAULT_OUTPUT_DIR / "convergence")
     )
 
-    # --- ablation subcommand ---
     all_dataset_names = [s["name"] for s in DATASET_SPECS]
+    model_choices = list(MODEL_REGISTRY.keys())
+
+    def _add_model_arg(p):
+        p.add_argument(
+            "--model", choices=model_choices, default="fedganblr",
+            help=f"Federated model to use: {model_choices} (default: fedganblr)"
+        )
+
+    def _add_training_args(p):
+        p.add_argument("--datasets", nargs="+", default=all_dataset_names,
+                       help=f"Dataset names (default: all)")
+        p.add_argument("--num-rounds", type=int, default=10)
+        p.add_argument("--num-clients", type=int, default=5)
+        p.add_argument("--dir-alpha", type=float, default=0.2)
+        _add_model_arg(p)
+
+    # --- ablation subcommand ---
     p_abl = subparsers.add_parser("ablation", help="Run ablation study")
-    p_abl.add_argument(
-        "--datasets", nargs="+", default=all_dataset_names,
-        help=f"Dataset names (default: all — {', '.join(all_dataset_names)})"
-    )
-    p_abl.add_argument(
-        "--output-dir", type=str,
-        default=str(DEFAULT_OUTPUT_DIR / "ablation")
-    )
-    p_abl.add_argument("--num-rounds", type=int, default=10)
-    p_abl.add_argument("--num-clients", type=int, default=5)
-    p_abl.add_argument("--dir-alpha", type=float, default=0.2)
+    _add_training_args(p_abl)
+    p_abl.add_argument("--output-dir", type=str,
+                       default=str(DEFAULT_OUTPUT_DIR / "ablation"))
 
     # --- reconstruct subcommand ---
     p_rec = subparsers.add_parser(
         "reconstruct",
         help="Rebuild ablation_results.csv from saved diagnostics, then generate charts"
     )
-    p_rec.add_argument(
-        "--diagnostics-dir", type=str, required=True,
-        help="Root diagnostics directory, e.g. analysis_output/ablation/diagnostics"
-    )
-    p_rec.add_argument(
-        "--output-dir", type=str,
-        default=str(DEFAULT_OUTPUT_DIR / "ablation"),
-        help="Where to write ablation_results.csv and chart PNGs"
-    )
-    p_rec.add_argument(
-        "--eval-syn-frac", type=float, default=0.5,
-        help="Fraction of training size to sample for synthetic evaluation (default: 0.5)"
-    )
+    p_rec.add_argument("--diagnostics-dir", type=str, required=True,
+                       help="Root diagnostics directory")
+    p_rec.add_argument("--output-dir", type=str,
+                       default=str(DEFAULT_OUTPUT_DIR / "ablation"))
+    p_rec.add_argument("--eval-syn-frac", type=float, default=0.5)
 
     # --- charts subcommand ---
     p_charts = subparsers.add_parser(
         "charts",
         help="Generate charts from an existing ablation_results.csv (no retraining)"
     )
-    p_charts.add_argument(
-        "--csv", type=str, required=True,
-        help="Path to ablation_results.csv"
-    )
-    p_charts.add_argument(
-        "--output-dir", type=str,
-        default=str(DEFAULT_OUTPUT_DIR / "charts")
-    )
+    p_charts.add_argument("--csv", type=str, required=True,
+                          help="Path to ablation_results.csv")
+    p_charts.add_argument("--output-dir", type=str,
+                          default=str(DEFAULT_OUTPUT_DIR / "charts"))
 
     # --- full subcommand ---
     p_full = subparsers.add_parser(
         "full",
         help="Run ablation then convergence analysis on generated diagnostics"
     )
-    p_full.add_argument(
-        "--datasets", nargs="+", default=all_dataset_names,
-        help=f"Dataset names (default: all — {', '.join(all_dataset_names)})"
-    )
-    p_full.add_argument(
-        "--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR)
-    )
-    p_full.add_argument("--num-rounds", type=int, default=10)
-    p_full.add_argument("--num-clients", type=int, default=5)
-    p_full.add_argument("--dir-alpha", type=float, default=0.2)
+    _add_training_args(p_full)
+    p_full.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
 
     args = parser.parse_args()
 
+    # -----------------------------------------------------------------------
+    # Helpers shared across handlers
+    # -----------------------------------------------------------------------
+    def _resolve_shared(args_ns):
+        _, _, default_shared = MODEL_REGISTRY.get(args_ns.model, MODEL_REGISTRY["fedganblr"])
+        shared = dict(default_shared)
+        shared["num_rounds"]  = args_ns.num_rounds
+        shared["num_clients"] = args_ns.num_clients
+        shared["dir_alpha"]   = args_ns.dir_alpha
+        return shared
+
+    def _resolve_datasets(args_ns):
+        selected = [s for s in DATASET_SPECS if s["name"] in args_ns.datasets]
+        if not selected:
+            print(f"No matching datasets for: {args_ns.datasets}")
+            print(f"Available: {[s['name'] for s in DATASET_SPECS]}")
+            sys.exit(1)
+        return selected
+
+    # -----------------------------------------------------------------------
     if args.command == "convergence":
         out_dir = Path(args.output_dir)
-        summary = run_convergence_analysis(Path(args.diagnostics_dir), out_dir)
+        run_convergence_analysis(Path(args.diagnostics_dir), out_dir)
         print("\n=== Convergence Analysis Complete ===")
 
     elif args.command == "reconstruct":
@@ -1206,19 +1258,10 @@ def main():
 
     elif args.command == "ablation":
         out_dir = Path(args.output_dir)
-        # Map dataset names to specs
-        selected = [s for s in DATASET_SPECS if s["name"] in args.datasets]
-        if not selected:
-            print(f"No matching datasets for: {args.datasets}")
-            print(f"Available: {[s['name'] for s in DATASET_SPECS]}")
-            sys.exit(1)
-
-        shared = dict(DEFAULT_SHARED_PARAMS)
-        shared["num_rounds"] = args.num_rounds
-        shared["num_clients"] = args.num_clients
-        shared["dir_alpha"] = args.dir_alpha
-
-        df = run_ablation_study(selected, out_dir, shared_params=shared)
+        selected = _resolve_datasets(args)
+        shared   = _resolve_shared(args)
+        df = run_ablation_study(selected, out_dir, shared_params=shared,
+                                model=args.model)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")
@@ -1226,29 +1269,23 @@ def main():
         print("\n=== Ablation Study Complete ===")
 
     elif args.command == "full":
-        out_dir = Path(args.output_dir)
-        selected = [s for s in DATASET_SPECS if s["name"] in args.datasets]
-        if not selected:
-            print(f"No matching datasets for: {args.datasets}")
-            print(f"Available: {[s['name'] for s in DATASET_SPECS]}")
-            sys.exit(1)
+        out_dir  = Path(args.output_dir)
+        selected = _resolve_datasets(args)
+        shared   = _resolve_shared(args)
+        _, ablation_cfgs, _ = MODEL_REGISTRY.get(args.model, MODEL_REGISTRY["fedganblr"])
 
-        shared = dict(DEFAULT_SHARED_PARAMS)
-        shared["num_rounds"] = args.num_rounds
-        shared["num_clients"] = args.num_clients
-        shared["dir_alpha"] = args.dir_alpha
-
-        # Step 1: Run ablation study (generates diagnostics for each config)
+        # Step 1: ablation
         abl_dir = out_dir / "ablation"
-        df = run_ablation_study(selected, abl_dir, shared_params=shared)
+        df = run_ablation_study(selected, abl_dir, shared_params=shared,
+                                model=args.model)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, abl_dir, metric_type="acc")
         plot_ablation_bar_chart(df, abl_dir, metric_type="nll")
         plot_ablation_delta_heatmap(deltas, abl_dir)
 
-        # Step 2: Run convergence analysis on each config's diagnostics
+        # Step 2: convergence on each config's diagnostics
         for spec in selected:
-            for config_name in ABLATION_CONFIGS:
+            for config_name in ablation_cfgs:
                 diag_path = abl_dir / "diagnostics" / spec["name"] / config_name
                 if diag_path.exists() and (diag_path / "global_round_stats.csv").exists():
                     conv_out = out_dir / "convergence" / spec["name"] / config_name
