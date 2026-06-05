@@ -13,8 +13,10 @@ def run_one_fold_fed_ganblr_fedstruct(
     Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
     k_global=2, num_clients=5, num_rounds=5, dir_alpha=0.1,
     gamma=0.6, local_epochs=3, batch_size=1024, disc_epochs=1,
-    cpt_mix=0.25, alpha_dir=1e-3, beta_pow=0.5, cap_train=None, clf="lr", verbose=False,
-    eval_syn_frac: float = 0.5,          
+    cpt_mix=0.25, alpha_dir=1e-3, beta_pow=0.5, kl_lambda=0.5,
+    use_theta_weights=True, alpha_mix=0.5, tau_floor=1e-6,
+    cap_train=None, clf="lr", verbose=False,
+    eval_syn_frac: float = 0.5,
     ray_local_mode: bool = True,
     diagnostics_dir: str | Path | None = None
 ):
@@ -44,8 +46,12 @@ def run_one_fold_fed_ganblr_fedstruct(
         cpt_mix=cpt_mix,
         alpha_dir=alpha_dir,
         beta_pow=beta_pow,
+        kl_lambda=kl_lambda,
+        use_theta_weights=use_theta_weights,
+        alpha_mix=alpha_mix,
+        tau_floor=tau_floor,
         adversarial=True,
-        nll_csv_path=None, 
+        nll_csv_path=None,
     )
     # Seed the strategy with bare minimum (card and y_index). `parents` starts empty.
     strategy.set_global_meta(card=card_all, parents={}, y_index=y_index)

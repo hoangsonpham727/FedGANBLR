@@ -824,6 +824,7 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         tau_floor: float = 1e-6,
         nll_csv_path: str | None = "nll_convergence.csv",
         use_theta_weights: bool = True,
+        kl_lambda: float = 0.5,
     ):
         super().__init__()
         self.k = int(k)
@@ -840,6 +841,7 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         self.alpha_mix = float(alpha_mix)
         self.beta_pow = float(beta_pow)
         self.tau_floor = float(tau_floor)
+        self.kl_lambda = float(kl_lambda)
         # Allow disabling NLL CSV writing by passing None/"".
         self.nll_csv_path = str(nll_csv_path) if nll_csv_path else None
         self.use_theta_weights = bool(use_theta_weights)
@@ -889,10 +891,11 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
             "disc_epochs": self.disc_epochs,
             "cpt_mix": self.cpt_mix,
             "adversarial": 1 if self.adversarial else 0,
-            "alpha_mix": self.alpha_mix,    
-            "beta_pow": self.beta_pow,      
+            "alpha_mix": self.alpha_mix,
+            "beta_pow": self.beta_pow,
             "tau_floor": self.tau_floor,
             "use_theta_weights": self.use_theta_weights,
+            "kl_lambda": self.kl_lambda,
             # Set verbose to 0 to keep client-side training quiet
             "verbose": 0,
         }

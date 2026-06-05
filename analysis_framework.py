@@ -49,27 +49,74 @@ from base_models.KDependenceBayesian import MLE_KDB
 
 DEFAULT_OUTPUT_DIR = Path("analysis_output")
 
+# ---------------------------------------------------------------------------
 # Ablation configs for FedGANBLR
+# ---------------------------------------------------------------------------
+# Two KL mechanisms must be kept distinct:
+#   gamma     -> SERVER-side KL-weighted aggregation: client_i weighted by
+#                n_i * exp(-gamma * KL_i). gamma=0 => plain n-weighted FedAvg.
+#   kl_lambda -> CLIENT-side KL proximal regulariser in the local training loss
+#                (pull each client's CPTs toward the global CPTs).
+# Other components:
+#   beta_pow          -> importance-weighting exponent on the per-row KL weights
+#                        W = mix^(-beta_pow); beta_pow=0 => uniform W (mechanism OFF).
+#   use_theta_weights -> True: build W from a mixture of learned PARAMETERS
+#                        (theta_local vs theta_global); False: from raw empirical
+#                        COUNTS. Only has any effect when beta_pow > 0.
+#   alpha_mix         -> mixture weight (alpha_mix*global + (1-alpha_mix)*local) for W.
+#   cpt_mix           -> post-training CPT interpolation toward the global model.
+#   alpha_dir         -> Dirichlet smoothing of aggregated CPT rows on the server.
+#
+# The configs are grouped so each group answers one analysis question. Default
+# component values when a key is omitted come from the runner signature.
+#
+# Full "baseline" component values (all components ON):
+_BASE = dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01, kl_lambda=0.5,
+             use_theta_weights=True, alpha_mix=0.5)
+# "Minimal" base = both KL mechanisms ON, every other regulariser OFF. Used as
+# the anchor for the gamma / kl_lambda / importance-weighting sweeps so each sweep
+# varies exactly one factor.
+_MIN = dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0, kl_lambda=0.5,
+            use_theta_weights=True, alpha_mix=0.5)
+
 ABLATION_CONFIGS = {
-    "baseline":              dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
-    "no_kl_weighting":       dict(gamma=0.0,  beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
-    "no_importance_weights": dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.6, alpha_dir=0.01),
-    "no_cpt_mix":            dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.0, alpha_dir=0.01),
-    "no_smoothing":          dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.0),
-    "kl_only":               dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0),
+    # --- A. Full model ---
+    "baseline":              {**_BASE},
+
+    # --- B. Leave-one-out from baseline (marginal contribution of each component) ---
+    "no_kl_weighting":       {**_BASE, "gamma": 0.0},        # server-side KL agg OFF
+    "no_importance_weights": {**_BASE, "beta_pow": 0.0},     # importance weighting OFF
+    "no_cpt_mix":            {**_BASE, "cpt_mix": 0.0},      # CPT mixing OFF
+    "no_smoothing":          {**_BASE, "alpha_dir": 0.0},    # Dirichlet smoothing OFF
+    "no_kl":                 {**_BASE, "kl_lambda": 0.0},    # client-side KL prox OFF
+
+    # --- C. Decomposition: build up from the FedAvg floor, isolate each KL term ---
+    "all_off":               {**_MIN, "gamma": 0.0, "kl_lambda": 0.0},  # pure FedAvg floor
+    "gamma_only":            {**_MIN, "kl_lambda": 0.0},                 # server-side KL alone
+    "kl_lambda_only":        {**_MIN, "gamma": 0.0},                     # client-side KL alone
+    "kl_only":               {**_MIN},                                   # both KL terms, rest OFF
+
+    # --- D. kl_lambda sensitivity (anchor = kl_only: gamma ON, others OFF) ---
+    # kl_lambda=0.0 == gamma_only ; kl_lambda=0.5 == kl_only
+    "klam_0p1":              {**_MIN, "kl_lambda": 0.1},
+    "klam_1p0":              {**_MIN, "kl_lambda": 1.0},
+
+    # --- E. gamma sensitivity (anchor = kl base: kl_lambda ON, others OFF) ---
+    # gamma=0.0 == kl_lambda_only ; gamma=0.25 == kl_only
+    "gamma_0p1":             {**_MIN, "gamma": 0.1},
+    "gamma_0p5":             {**_MIN, "gamma": 0.5},
+    "gamma_1p0":             {**_MIN, "gamma": 1.0},
+
+    # --- F. Importance weighting: PARAMETERS vs raw COUNTS (only differs at beta_pow>0) ---
+    "iw_params":             {**_MIN, "beta_pow": 0.5, "use_theta_weights": True},
+    "iw_counts":             {**_MIN, "beta_pow": 0.5, "use_theta_weights": False},
 }
 
-# Ablation configs for FedStruct — same component sweep, same parameter names
-# FedStruct adds a structure-learning round (round 1) on top of the parameter rounds,
-# so the same components apply; the structure round itself is always active.
-ABLATION_CONFIGS_FEDSTRUCT = {
-    "baseline":              dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
-    "no_kl_weighting":       dict(gamma=0.0,  beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01),
-    "no_importance_weights": dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.6, alpha_dir=0.01),
-    "no_cpt_mix":            dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.0, alpha_dir=0.01),
-    "no_smoothing":          dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.0),
-    "kl_only":               dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0),
-}
+# Ablation configs for FedStruct — identical component sweep. FedStruct adds a
+# structure-learning round (round 1) on top of the parameter rounds; the same
+# components apply to the parameter rounds and the structure round is always active.
+# Aliased to the single source of truth above to avoid the two sets drifting apart.
+ABLATION_CONFIGS_FEDSTRUCT = ABLATION_CONFIGS
 
 # Map model name → (runner function, ablation configs, shared params)
 # Resolved at runtime after DEFAULT_SHARED_PARAMS_FEDSTRUCT is defined below.
@@ -93,6 +140,8 @@ DEFAULT_SHARED_PARAMS = dict(
     disc_epochs=1,
     eval_syn_frac=0.5,
     cap_train=None,
+    # kl_lambda is intentionally NOT here — each ablation config sets it explicitly
+    # so the baseline vs no_kl comparison is clean.
 )
 
 # FedStruct uses the same parameters; num_rounds here = parameter-training rounds
@@ -742,7 +791,8 @@ def run_single_ablation(config_name: str, config_params: dict,
         diag_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"    [{model}] config '{config_name}': "
-          f"gamma={merged.get('gamma')}, beta_pow={merged.get('beta_pow')}, "
+          f"gamma={merged.get('gamma')}, kl_lambda={merged.get('kl_lambda')}, "
+          f"beta_pow={merged.get('beta_pow')}, use_theta_weights={merged.get('use_theta_weights')}, "
           f"cpt_mix={merged.get('cpt_mix')}, alpha_dir={merged.get('alpha_dir')}")
 
     t0 = time.time()
@@ -1153,6 +1203,9 @@ def main():
     def _add_training_args(p):
         p.add_argument("--datasets", nargs="+", default=all_dataset_names,
                        help=f"Dataset names (default: all)")
+        p.add_argument("--configs", nargs="+", default=None,
+                       help="Subset of ablation config names to run (default: all). "
+                            "See ABLATION_CONFIGS for available names.")
         p.add_argument("--num-rounds", type=int, default=10)
         p.add_argument("--num-clients", type=int, default=5)
         p.add_argument("--dir-alpha", type=float, default=0.2)
@@ -1214,6 +1267,19 @@ def main():
             sys.exit(1)
         return selected
 
+    def _resolve_configs(args_ns):
+        """Return the (possibly filtered) ablation-config dict for the chosen model."""
+        _, default_configs, _ = MODEL_REGISTRY.get(args_ns.model, MODEL_REGISTRY["fedganblr"])
+        requested = getattr(args_ns, "configs", None)
+        if not requested:
+            return default_configs
+        unknown = [c for c in requested if c not in default_configs]
+        if unknown:
+            print(f"Unknown config name(s): {unknown}")
+            print(f"Available: {list(default_configs.keys())}")
+            sys.exit(1)
+        return {c: default_configs[c] for c in requested}
+
     # -----------------------------------------------------------------------
     if args.command == "convergence":
         out_dir = Path(args.output_dir)
@@ -1260,7 +1326,8 @@ def main():
         out_dir = Path(args.output_dir)
         selected = _resolve_datasets(args)
         shared   = _resolve_shared(args)
-        df = run_ablation_study(selected, out_dir, shared_params=shared,
+        cfgs     = _resolve_configs(args)
+        df = run_ablation_study(selected, out_dir, configs=cfgs, shared_params=shared,
                                 model=args.model)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
@@ -1272,12 +1339,12 @@ def main():
         out_dir  = Path(args.output_dir)
         selected = _resolve_datasets(args)
         shared   = _resolve_shared(args)
-        _, ablation_cfgs, _ = MODEL_REGISTRY.get(args.model, MODEL_REGISTRY["fedganblr"])
+        ablation_cfgs = _resolve_configs(args)
 
         # Step 1: ablation
         abl_dir = out_dir / "ablation"
-        df = run_ablation_study(selected, abl_dir, shared_params=shared,
-                                model=args.model)
+        df = run_ablation_study(selected, abl_dir, configs=ablation_cfgs,
+                                shared_params=shared, model=args.model)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, abl_dir, metric_type="acc")
         plot_ablation_bar_chart(df, abl_dir, metric_type="nll")

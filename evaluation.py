@@ -324,8 +324,10 @@ def run_one_fold_fed_ganblr(
     Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
     k_global=2, num_clients=5, num_rounds=5, dir_alpha=0.1,
     gamma=0.6, local_epochs=3, batch_size=1024, disc_epochs=1,
-    cpt_mix=0.25, alpha_dir=1e-3, beta_pow=0.5, cap_train=None, clf="lr", verbose=False,
-    eval_syn_frac: float = 0.5,          
+    cpt_mix=0.25, alpha_dir=1e-3, beta_pow=0.5, kl_lambda=0.5,
+    use_theta_weights=True, alpha_mix=0.5, tau_floor=1e-6,
+    cap_train=None, clf="lr", verbose=False,
+    eval_syn_frac: float = 0.5,
     ray_local_mode: bool = False,
     diagnostics_dir: str | Path | None = None
 ):
@@ -372,6 +374,11 @@ def run_one_fold_fed_ganblr(
                 "disc_epochs": disc_epochs,
                 "cpt_mix": cpt_mix,
                 "alpha_dir": alpha_dir,
+                "beta_pow": beta_pow,
+                "kl_lambda": kl_lambda,
+                "use_theta_weights": use_theta_weights,
+                "alpha_mix": alpha_mix,
+                "tau_floor": tau_floor,
                 "eval_syn_frac": eval_syn_frac,
                 "train_class_counts": train_counts,
                 "test_class_counts": test_counts,
@@ -390,6 +397,10 @@ def run_one_fold_fed_ganblr(
         cpt_mix=cpt_mix,
         alpha_dir=alpha_dir,
         beta_pow=beta_pow,
+        kl_lambda=kl_lambda,
+        use_theta_weights=use_theta_weights,
+        alpha_mix=alpha_mix,
+        tau_floor=tau_floor,
         adversarial=True,
         nll_csv_path=None,  # disable NLL CSV writing
     )
