@@ -96,56 +96,23 @@ class KDBGANStrategy_FedStruct(KDBGANStrategy):
     def aggregate_fit(self, server_round, results, failures):
         server_round = int(server_round)
         if server_round == 1:
-            # Collect per-edge vote counts weighted by client sample size
-            edge_votes = {}    # (v, parent) -> total sample weight
-            total_n = 0
-            n_reporting = 0
-
-            for _, fit_res in results:
-                metrics = fit_res.metrics or {}
-                if "local_parents_json" not in metrics:
-                    continue
-                n_local = int(metrics.get("n", fit_res.num_examples))
-                n_reporting += 1
-                total_n += n_local
-                local_parents = json.loads(metrics["local_parents_json"])
-                for v_str, parents_list in local_parents.items():
-                    v = int(v_str)
-                    for p in parents_list:
-                        key = (v, int(p))
-                        edge_votes[key] = edge_votes.get(key, 0) + n_local
-
-            if n_reporting == 0:
-                import warnings
-                warnings.warn("FedStruct: No clients reported structure in round 1. "
-                              "Falling back to Naive Bayes (Y-only parents).")
-
-            # For each feature, keep only the top-k parents by vote weight
+            # FedStruct round 1 — structure aggregation.
+            # Each client sent its locally-learned MLE model (structure + params).
+            # The server generates synthetic data from every client's model, pools
+            # it, and learns a single global structure on the combined synthetic data.
             k = int(self.k)
             y_index = int(self.meta["y_index"])
             card = self.meta["card"]
             V = len(card)
-            final_parents = {}
-            for v in range(V):
-                if v == y_index:
-                    continue
-                # Gather all candidate parents for this feature with their votes
-                candidates = []
-                for (fv, p), weight in edge_votes.items():
-                    if fv == v:
-                        candidates.append((p, weight))
-                # Sort by vote weight descending, take top-k
-                candidates.sort(key=lambda t: -t[1])
-                final_parents[v] = [p for p, _ in candidates[:k]]
 
-            # Refine structure: generate synthetic data from each client's
-            # local MLE model, combine, and re-learn structure.
             syn_arrays = []
+            n_reporting = 0
             for _, fit_res in results:
                 metrics = fit_res.metrics or {}
                 if "mle_py_json" not in metrics or "mle_thetas_json" not in metrics:
                     continue
                 n_local = int(metrics.get("n", fit_res.num_examples))
+                n_reporting += 1
                 client_parents = {
                     int(v): list(ps)
                     for v, ps in json.loads(metrics["local_parents_json"]).items()
@@ -167,10 +134,16 @@ class KDBGANStrategy_FedStruct(KDBGANStrategy):
 
             if syn_arrays:
                 combined_syn = np.vstack(syn_arrays)
-                refined_parents, _ = _build_kdb_structure(combined_syn, card, y_index, k)
+                global_parents, _ = _build_kdb_structure(combined_syn, card, y_index, k)
                 final_parents = {
-                    v: ps for v, ps in refined_parents.items() if v != y_index
+                    v: ps for v, ps in global_parents.items() if v != y_index
                 }
+            else:
+                # No client reported a model: fall back to Naive Bayes (Y-only parents).
+                import warnings
+                warnings.warn("FedStruct: No clients reported a model in round 1. "
+                              "Falling back to Naive Bayes (Y-only parents).")
+                final_parents = {v: [] for v in range(V) if v != y_index}
 
             self.set_global_meta(card, final_parents, y_index)
 
@@ -178,7 +151,6 @@ class KDBGANStrategy_FedStruct(KDBGANStrategy):
                 "phase": "structure_aggregated",
                 "round": server_round,
                 "n_reporting_clients": n_reporting,
-                "total_edges_before_cap": len(edge_votes),
             }
         else:
             # Regular parameter aggregation
