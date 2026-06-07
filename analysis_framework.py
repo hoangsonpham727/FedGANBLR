@@ -69,45 +69,46 @@ DEFAULT_OUTPUT_DIR = Path("analysis_output")
 # The configs are grouped so each group answers one analysis question. Default
 # component values when a key is omitted come from the runner signature.
 #
-# Full "baseline" component values (all components ON):
-_BASE = dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, kl_lambda=0.5,
+# NEW BASELINE = the recommended light config from the previous ablation
+# (alpha_dir removed entirely). Every other config is exactly one step away from
+# it, so the run answers: "is this baseline the best, or does some neighbour win?"
+#   gamma=0.5  (server KL agg, slightly stronger) | kl_lambda=0.5 (client KL prox)
+#   beta_pow=0.5 + use_theta_weights=True (parameter-based importance weighting)
+#   cpt_mix=0.0 (post-training CPT mixing OFF by default)
+_BASE = dict(gamma=0.5, beta_pow=0.5, cpt_mix=0.0, kl_lambda=0.5,
              use_theta_weights=True, alpha_mix=0.5)
-# "Minimal" base = both KL mechanisms ON, every other regulariser OFF. Used as
-# the anchor for the gamma / kl_lambda / importance-weighting sweeps so each sweep
-# varies exactly one factor.
-_MIN = dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, kl_lambda=0.5,
-            use_theta_weights=True, alpha_mix=0.5)
 
 ABLATION_CONFIGS = {
-    # --- A. Full model ---
+    # --- A. The recommended baseline ---
     "baseline":              {**_BASE},
 
-    # --- B. Leave-one-out from baseline (marginal contribution of each component) ---
-    "no_kl_weighting":       {**_BASE, "gamma": 0.0},        # server-side KL agg OFF
-    "no_importance_weights": {**_BASE, "beta_pow": 0.0},     # importance weighting OFF
-    "no_cpt_mix":            {**_BASE, "cpt_mix": 0.0},      # CPT mixing OFF
+    # --- B. Leave-one-out: turn OFF each ACTIVE component of the baseline ---
+    #     If accuracy drops, the component is pulling its weight.
+    "no_gamma":              {**_BASE, "gamma": 0.0},        # server-side KL agg OFF
+    "no_iw":                 {**_BASE, "beta_pow": 0.0},     # importance weighting OFF
     "no_kl":                 {**_BASE, "kl_lambda": 0.0},    # client-side KL prox OFF
 
-    # --- C. Decomposition: build up from the FedAvg floor, isolate each KL term ---
-    "all_off":               {**_MIN, "gamma": 0.0, "kl_lambda": 0.0},  # pure FedAvg floor
-    "gamma_only":            {**_MIN, "kl_lambda": 0.0},                 # server-side KL alone
-    "kl_lambda_only":        {**_MIN, "gamma": 0.0},                     # client-side KL alone
-    "kl_only":               {**_MIN},                                   # both KL terms, rest OFF
+    # --- C. Decomposition: FedAvg floor + each KL anchor alone ---
+    "all_off":               {**_BASE, "gamma": 0.0, "beta_pow": 0.0, "kl_lambda": 0.0},
+    "gamma_only":            {**_BASE, "beta_pow": 0.0, "kl_lambda": 0.0},  # server KL alone
+    "kl_lambda_only":        {**_BASE, "gamma": 0.0, "beta_pow": 0.0},      # client KL alone
 
-    # --- D. kl_lambda sensitivity (anchor = kl_only: gamma ON, others OFF) ---
-    # kl_lambda=0.0 == gamma_only ; kl_lambda=0.5 == kl_only
-    "klam_0p1":              {**_MIN, "kl_lambda": 0.1},
-    "klam_1p0":              {**_MIN, "kl_lambda": 1.0},
+    # --- D. gamma sensitivity (vary only gamma; baseline=0.5) ---
+    "gamma_0p25":            {**_BASE, "gamma": 0.25},
+    "gamma_1p0":             {**_BASE, "gamma": 1.0},
 
-    # --- E. gamma sensitivity (anchor = kl base: kl_lambda ON, others OFF) ---
-    # gamma=0.0 == kl_lambda_only ; gamma=0.25 == kl_only
-    "gamma_0p1":             {**_MIN, "gamma": 0.1},
-    "gamma_0p5":             {**_MIN, "gamma": 0.5},
-    "gamma_1p0":             {**_MIN, "gamma": 1.0},
+    # --- E. kl_lambda sensitivity (vary only kl_lambda; baseline=0.5) ---
+    "klam_0p1":              {**_BASE, "kl_lambda": 0.1},
+    "klam_1p0":              {**_BASE, "kl_lambda": 1.0},
 
-    # --- F. Importance weighting: PARAMETERS vs raw COUNTS (only differs at beta_pow>0) ---
-    "iw_params":             {**_MIN, "beta_pow": 0.5, "use_theta_weights": True},
-    "iw_counts":             {**_MIN, "beta_pow": 0.5, "use_theta_weights": False},
+    # --- F. cpt_mix ADD-BACK (baseline=0.0; does adding it help, esp. car/adult?) ---
+    "cpt_0p1":               {**_BASE, "cpt_mix": 0.1},
+    "cpt_0p25":              {**_BASE, "cpt_mix": 0.25},
+    "cpt_0p6":               {**_BASE, "cpt_mix": 0.6},
+
+    # --- G. Importance weighting: PARAMETERS (baseline) vs raw COUNTS ---
+    #     baseline already IS the parameters arm; this is the counts counterpart.
+    "iw_counts":             {**_BASE, "use_theta_weights": False},
 }
 
 # Ablation configs for FedStruct — identical component sweep. FedStruct adds a
