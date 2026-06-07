@@ -40,7 +40,6 @@ def main():
         "batch_size": 512,  
         "disc_epochs": 1,
         "cpt_mix": 0.6,
-        "alpha_dir": 0.01,
         "cap_train": None,
     }
     df_cmp_folds, df_cmp_sum = compare_real_central_fed_cv_all_datasets(DATASETS, **compare_cfg)

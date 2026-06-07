@@ -324,7 +324,7 @@ def run_one_fold_fed_ganblr(
     Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
     k_global=2, num_clients=5, num_rounds=5, dir_alpha=0.1,
     gamma=0.6, local_epochs=3, batch_size=1024, disc_epochs=1,
-    cpt_mix=0.25, alpha_dir=1e-3, beta_pow=0.5, kl_lambda=0.5,
+    cpt_mix=0.25, beta_pow=0.5, kl_lambda=0.5,
     use_theta_weights=True, alpha_mix=0.5, tau_floor=1e-6,
     cap_train=None, clf="lr", verbose=False,
     eval_syn_frac: float = 0.5,
@@ -373,7 +373,6 @@ def run_one_fold_fed_ganblr(
                 "batch_size": batch_size,
                 "disc_epochs": disc_epochs,
                 "cpt_mix": cpt_mix,
-                "alpha_dir": alpha_dir,
                 "beta_pow": beta_pow,
                 "kl_lambda": kl_lambda,
                 "use_theta_weights": use_theta_weights,
@@ -395,7 +394,6 @@ def run_one_fold_fed_ganblr(
         batch_size=batch_size,
         disc_epochs=disc_epochs,
         cpt_mix=cpt_mix,
-        alpha_dir=alpha_dir,
         beta_pow=beta_pow,
         kl_lambda=kl_lambda,
         use_theta_weights=use_theta_weights,
@@ -510,7 +508,6 @@ def run_one_fold_fed_ganblr(
                 "batch_size": batch_size,
                 "disc_epochs": disc_epochs,
                 "cpt_mix": cpt_mix,
-                "alpha_dir": alpha_dir,
                 "eval_syn_frac": eval_syn_frac,
             }
             (diag_dir / "fold_config.json").write_text(json.dumps(fold_config, indent=2))
@@ -644,7 +641,7 @@ def compare_real_central_fed_cv_all_datasets(
     # federated params
     num_clients=5, num_rounds=5, dir_alpha=0.3,
     gamma=0.6, local_epochs=3, batch_size=1024, disc_epochs=1,
-    cpt_mix=0.25, alpha_dir=1e-3, cap_train=60000,
+    cpt_mix=0.25, cap_train=60000,
     # memory management
     max_memory_gb=8.0, force_gc_every_n_folds=3,
     # output paths
@@ -819,7 +816,7 @@ def compare_real_central_fed_cv_all_datasets(
                                 Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
                                 k_global=k_global, num_clients=num_clients, num_rounds=num_rounds, dir_alpha=dir_alpha,
                                 gamma=gamma, local_epochs=local_epochs, batch_size=batch_size, disc_epochs=disc_epochs,
-                                cpt_mix=cpt_mix, alpha_dir=alpha_dir, cap_train=None,
+                                cpt_mix=cpt_mix, cap_train=None,
                                 ray_local_mode=False,  # Use local mode to reduce overhead
                                 diagnostics_dir=diag_dir
                             )

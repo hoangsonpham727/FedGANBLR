@@ -817,7 +817,6 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         batch_size: int = 1024,
         disc_epochs: int = 1,
         cpt_mix: float = 0.25,
-        alpha_dir: float = 1e-3,
         adversarial: bool = False,
         alpha_mix: float = 0.5,
         beta_pow: float = 0.0,
@@ -833,7 +832,6 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         self.batch_size = int(batch_size)
         self.disc_epochs = int(disc_epochs)
         self.cpt_mix = float(cpt_mix)
-        self.alpha_dir = float(alpha_dir)
         self.adversarial = bool(adversarial)
         self.global_model = None
         self.meta = None
@@ -1059,20 +1057,6 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         # KL-weighted aggregation using s_y
         self.global_model = aggregate_models(client_models, self.gamma, self.global_model,
                                              card=card, parents_full=parents_full, y_index=y_index, s_y=s_y)
-        # === Dirichlet smoothing per CPT row ===
-        try:
-            ad = max(0.0, float(self.alpha_dir))
-        except Exception:
-            ad = 1e-3
-        for v, M in list(self.global_model["thetas"].items()):
-            B = np.array(M, dtype=np.float64)
-            if B.size == 0:
-                continue
-            B = np.clip(B + ad, 1e-12, None)
-            B = B / B.sum(axis=1, keepdims=True)
-            self.global_model["thetas"][v] = B
-        py = np.clip(self.global_model["py"] + ad, 1e-12, None)
-        self.global_model["py"] = py / py.sum()
 
         # Attach s_y for inspection
         self.global_model["s_y"] = s_y

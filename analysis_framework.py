@@ -65,18 +65,17 @@ DEFAULT_OUTPUT_DIR = Path("analysis_output")
 #                        COUNTS. Only has any effect when beta_pow > 0.
 #   alpha_mix         -> mixture weight (alpha_mix*global + (1-alpha_mix)*local) for W.
 #   cpt_mix           -> post-training CPT interpolation toward the global model.
-#   alpha_dir         -> Dirichlet smoothing of aggregated CPT rows on the server.
 #
 # The configs are grouped so each group answers one analysis question. Default
 # component values when a key is omitted come from the runner signature.
 #
 # Full "baseline" component values (all components ON):
-_BASE = dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, alpha_dir=0.01, kl_lambda=0.5,
+_BASE = dict(gamma=0.25, beta_pow=0.5, cpt_mix=0.6, kl_lambda=0.5,
              use_theta_weights=True, alpha_mix=0.5)
 # "Minimal" base = both KL mechanisms ON, every other regulariser OFF. Used as
 # the anchor for the gamma / kl_lambda / importance-weighting sweeps so each sweep
 # varies exactly one factor.
-_MIN = dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, alpha_dir=0.0, kl_lambda=0.5,
+_MIN = dict(gamma=0.25, beta_pow=0.0, cpt_mix=0.0, kl_lambda=0.5,
             use_theta_weights=True, alpha_mix=0.5)
 
 ABLATION_CONFIGS = {
@@ -87,7 +86,6 @@ ABLATION_CONFIGS = {
     "no_kl_weighting":       {**_BASE, "gamma": 0.0},        # server-side KL agg OFF
     "no_importance_weights": {**_BASE, "beta_pow": 0.0},     # importance weighting OFF
     "no_cpt_mix":            {**_BASE, "cpt_mix": 0.0},      # CPT mixing OFF
-    "no_smoothing":          {**_BASE, "alpha_dir": 0.0},    # Dirichlet smoothing OFF
     "no_kl":                 {**_BASE, "kl_lambda": 0.0},    # client-side KL prox OFF
 
     # --- C. Decomposition: build up from the FedAvg floor, isolate each KL term ---
@@ -723,7 +721,7 @@ def run_convergence_analysis(diagnostics_dir: Path, out_dir: Path) -> dict:
     if fold_config:
         print(f"  Config: gamma={fold_config.get('gamma')}, "
               f"cpt_mix={fold_config.get('cpt_mix')}, "
-              f"alpha_dir={fold_config.get('alpha_dir')}")
+              f"kl_lambda={fold_config.get('kl_lambda')}")
 
     # Run all plot functions
     plot_kl_convergence(df_rounds, out_dir)
@@ -793,7 +791,7 @@ def run_single_ablation(config_name: str, config_params: dict,
     print(f"    [{model}] config '{config_name}': "
           f"gamma={merged.get('gamma')}, kl_lambda={merged.get('kl_lambda')}, "
           f"beta_pow={merged.get('beta_pow')}, use_theta_weights={merged.get('use_theta_weights')}, "
-          f"cpt_mix={merged.get('cpt_mix')}, alpha_dir={merged.get('alpha_dir')}")
+          f"cpt_mix={merged.get('cpt_mix')}")
 
     t0 = time.time()
     try:
