@@ -1043,6 +1043,162 @@ def plot_ablation_delta_heatmap(df_deltas: pd.DataFrame, out_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Aggregate across datasets: mean metric per (config, classifier)
+# ---------------------------------------------------------------------------
+
+def compute_dataset_average(df_ablation: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
+    """
+    Average each metric across datasets for every (config, classifier).
+
+    Produces one row per config holding the mean over all datasets of each
+    acc_/nll_ column, plus an across-classifier mean (acc_mean / nll_mean).
+    Rows are ranked by mean accuracy (best first). Writes
+    'ablation_mean_across_datasets.csv' (means + per-metric std) and prints a
+    ranked summary so the best overall config is obvious.
+    """
+    metric_cols = [c for c in df_ablation.columns if c.startswith(("acc_", "nll_"))]
+    if not metric_cols or "config_name" not in df_ablation.columns:
+        print("  Dataset average: skipped (no metric columns or config_name)")
+        return pd.DataFrame()
+
+    n_datasets = int(df_ablation["dataset"].nunique()) if "dataset" in df_ablation.columns else 1
+
+    # sort=False keeps the configuration order from ABLATION_CONFIGS
+    grouped = df_ablation.groupby("config_name", sort=False)
+    mean_df = grouped[metric_cols].mean()
+    std_df = grouped[metric_cols].std(ddof=0)
+
+    acc_cols = [c for c in metric_cols if c.startswith("acc_")]
+    nll_cols = [c for c in metric_cols if c.startswith("nll_")]
+    if acc_cols:
+        mean_df["acc_mean"] = mean_df[acc_cols].mean(axis=1)
+    if nll_cols:
+        mean_df["nll_mean"] = mean_df[nll_cols].mean(axis=1)
+
+    # Rank by overall mean accuracy (desc); fall back to first column
+    sort_key = "acc_mean" if "acc_mean" in mean_df.columns else mean_df.columns[0]
+    mean_df = mean_df.sort_values(sort_key, ascending=False)
+
+    # CSV with means + per-metric std across datasets
+    out = mean_df.copy()
+    for c in metric_cols:
+        out[f"{c}_std"] = std_df[c]
+    out.insert(0, "n_datasets", n_datasets)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "ablation_mean_across_datasets.csv"
+    out.to_csv(csv_path)
+    print(f"\n  Mean-across-datasets table saved to: {csv_path}")
+
+    if acc_cols:
+        show_cols = acc_cols + (["acc_mean"] if "acc_mean" in mean_df.columns else [])
+        print(f"\n{'='*60}")
+        print(f"Mean accuracy across {n_datasets} datasets (ranked, best first)")
+        print(f"{'='*60}")
+        print(mean_df[show_cols].to_string(float_format="{:.4f}".format))
+        best = mean_df[sort_key].idxmax()
+        print(f"\n  Best config by mean accuracy: '{best}' "
+              f"({mean_df.loc[best, sort_key]:.4f})")
+        if "baseline" in mean_df.index:
+            print(f"  Baseline mean accuracy:        "
+                  f"{mean_df.loc['baseline', sort_key]:.4f} "
+                  f"(rank {list(mean_df.index).index('baseline') + 1}/{len(mean_df)})")
+
+    return mean_df
+
+
+def plot_dataset_average(mean_df: pd.DataFrame, out_dir: Path,
+                         metric_type: str = "acc") -> Path:
+    """Grouped bar chart of the across-datasets mean per config & classifier."""
+    _setup_style()
+    out_path = out_dir / f"ablation_mean_{metric_type}.png"
+    if mean_df is None or mean_df.empty:
+        print(f"  Dataset-average bar ({metric_type}): skipped (no data)")
+        return out_path
+
+    cols = [f"{metric_type}_{c}" for c in CLASSIFIERS if f"{metric_type}_{c}" in mean_df.columns]
+    if not cols:
+        return out_path
+
+    configs = mean_df.index.tolist()
+    x = np.arange(len(configs))
+    n_metrics = len(cols)
+    width = 0.8 / n_metrics
+    colors = plt.cm.Set2(np.linspace(0, 1, n_metrics))
+
+    fig, ax = plt.subplots(figsize=(max(10, 0.8 * len(configs) + 4), 6))
+    for j, col in enumerate(cols):
+        vals = mean_df[col].values.astype(float)
+        offset = (j - n_metrics / 2 + 0.5) * width
+        ax.bar(x + offset, vals, width, label=col.split("_")[1].upper(),
+               color=colors[j], edgecolor="gray", linewidth=0.5)
+
+    mean_col = f"{metric_type}_mean"
+    if mean_col in mean_df.columns:
+        ax.plot(x, mean_df[mean_col].values.astype(float), "k--o",
+                markersize=4, linewidth=1.5, label=f"{metric_type.upper()} mean")
+
+    ax.set_xticks(x)
+    labels = [("★ " + c if c == "baseline" else c) for c in configs]
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel(f"{metric_type.upper()} (mean across datasets)")
+    ax.set_title(f"Ablation: mean {metric_type.upper()} across datasets "
+                 f"(per config & classifier, ranked)")
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_dataset_average_heatmap(mean_df: pd.DataFrame, out_dir: Path,
+                                 metric_type: str = "acc") -> Path:
+    """Heatmap of the across-datasets mean: rows=config (ranked), cols=classifier."""
+    _setup_style()
+    out_path = out_dir / f"ablation_mean_{metric_type}_heatmap.png"
+    if mean_df is None or mean_df.empty:
+        print(f"  Dataset-average heatmap ({metric_type}): skipped (no data)")
+        return out_path
+
+    cols = [f"{metric_type}_{c}" for c in CLASSIFIERS if f"{metric_type}_{c}" in mean_df.columns]
+    mean_col = f"{metric_type}_mean"
+    show_cols = cols + ([mean_col] if mean_col in mean_df.columns else [])
+    if not show_cols:
+        return out_path
+
+    data = mean_df[show_cols].values.astype(float)
+    cmap = "YlGn" if metric_type == "acc" else "YlOrRd_r"  # higher acc greener, lower nll better
+
+    fig, ax = plt.subplots(figsize=(1.5 * len(show_cols) + 3, 0.5 * len(mean_df) + 2))
+    im = ax.imshow(data, cmap=cmap, aspect="auto")
+    ax.set_xticks(range(len(show_cols)))
+    ax.set_xticklabels([c.replace(f"{metric_type}_", "").upper() for c in show_cols], fontsize=9)
+    ax.set_yticks(range(len(mean_df)))
+    ax.set_yticklabels(mean_df.index.tolist(), fontsize=9)
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            v = data[i, j]
+            if not np.isnan(v):
+                ax.text(j, i, f"{v:.3f}", ha="center", va="center", fontsize=8)
+    ax.set_title(f"Mean {metric_type.upper()} across datasets (config × classifier)")
+    plt.colorbar(im, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def emit_dataset_average(df: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
+    """Convenience: compute the mean-across-datasets table and its charts."""
+    mean_df = compute_dataset_average(df, out_dir)
+    plot_dataset_average(mean_df, out_dir, metric_type="acc")
+    plot_dataset_average(mean_df, out_dir, metric_type="nll")
+    plot_dataset_average_heatmap(mean_df, out_dir, metric_type="acc")
+    plot_dataset_average_heatmap(mean_df, out_dir, metric_type="nll")
+    return mean_df
+
+
+# ---------------------------------------------------------------------------
 # Reconstruct ablation_results.csv from diagnostics directories
 # ---------------------------------------------------------------------------
 
@@ -1300,6 +1456,7 @@ def main():
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")
         plot_ablation_delta_heatmap(deltas, out_dir)
+        emit_dataset_average(df, out_dir)
         print(f"\nCharts saved to: {out_dir}")
         print("=== Reconstruct Complete ===")
 
@@ -1318,6 +1475,7 @@ def main():
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")
         plot_ablation_delta_heatmap(deltas, out_dir)
+        emit_dataset_average(df, out_dir)
         print(f"\nCharts saved to: {out_dir}")
         print("=== Charts Complete ===")
 
@@ -1332,6 +1490,7 @@ def main():
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")
         plot_ablation_delta_heatmap(deltas, out_dir)
+        emit_dataset_average(df, out_dir)
         print("\n=== Ablation Study Complete ===")
 
     elif args.command == "full":
@@ -1348,6 +1507,7 @@ def main():
         plot_ablation_bar_chart(df, abl_dir, metric_type="acc")
         plot_ablation_bar_chart(df, abl_dir, metric_type="nll")
         plot_ablation_delta_heatmap(deltas, abl_dir)
+        emit_dataset_average(df, abl_dir)
 
         # Step 2: convergence on each config's diagnostics
         for spec in selected:
