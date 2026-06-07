@@ -741,36 +741,63 @@ def run_convergence_analysis(diagnostics_dir: Path, out_dir: Path) -> dict:
 # Part 2: Ablation Study
 # ---------------------------------------------------------------------------
 
-def prepare_dataset(dataset_spec: dict, ef_bins: int = 12,
-                    random_state: int = 2025) -> tuple:
+def prepare_dataset_folds(dataset_spec: dict, num_folds: int = 1, ef_bins: int = 12,
+                          random_state: int = 2025) -> list:
     """
-    Load and discretize a dataset, returning a single train/test split.
-    Returns (Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes).
+    Load a dataset once and yield up to `num_folds` stratified train/test splits.
+
+    Returns a list of tuples:
+        (fold_idx, Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes).
+
+    num_folds=1 reproduces the original single-split behaviour (n_splits=2, first
+    fold, ~50% test). num_folds>1 uses n_splits=num_folds (test ~ 1/num_folds each),
+    so every sample is held out exactly once across the folds.
     """
     name = dataset_spec["name"]
-    print(f"\n  Preparing dataset: {name}")
+    num_folds = max(1, int(num_folds))
+    print(f"\n  Preparing dataset: {name} ({num_folds} fold(s))")
 
     X, y = fetch_openml_safely(name=name, data_id=dataset_spec.get("data_id"),
                                 target=dataset_spec["target"])
     y = y.astype("category").cat.codes
 
-    # Single train/test split
-    cv = RepeatedStratifiedKFold(n_splits=2, n_repeats=1, random_state=random_state)
-    tr_idx, te_idx = next(cv.split(X, y))
-    Xtr_df, Xte_df = X.iloc[tr_idx], X.iloc[te_idx]
-    ytr_sr, yte_sr = y.iloc[tr_idx], y.iloc[te_idx]
-
-    if name.lower() == "covertype":
-        Xtr_df = preprocess_covertype_binary_columns(Xtr_df)
-        Xte_df = preprocess_covertype_binary_columns(Xte_df)
-
+    # n_splits must be >= 2; for a single fold we keep the historical 50/50 split.
+    n_splits = max(2, num_folds)
+    cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=1, random_state=random_state)
     ef_bins_use = dataset_spec.get("ef_bins") or ef_bins
-    Xtr_int, Xte_int, ytr_int, yte_int, card_feat, classes = discretize_train_test_no_leak(
-        Xtr_df, ytr_sr, Xte_df, yte_sr, strategy="ef", ef_bins=ef_bins_use
-    )
-    num_classes = len(classes)
-    print(f"    n_train={len(Xtr_int)}, n_test={len(Xte_int)}, "
-          f"n_features={Xtr_int.shape[1]}, n_classes={num_classes}")
+
+    folds = []
+    for fold_idx, (tr_idx, te_idx) in enumerate(cv.split(X, y)):
+        if fold_idx >= num_folds:
+            break
+        Xtr_df, Xte_df = X.iloc[tr_idx], X.iloc[te_idx]
+        ytr_sr, yte_sr = y.iloc[tr_idx], y.iloc[te_idx]
+
+        if name.lower() == "covertype":
+            Xtr_df = preprocess_covertype_binary_columns(Xtr_df)
+            Xte_df = preprocess_covertype_binary_columns(Xte_df)
+
+        Xtr_int, Xte_int, ytr_int, yte_int, card_feat, classes = discretize_train_test_no_leak(
+            Xtr_df, ytr_sr, Xte_df, yte_sr, strategy="ef", ef_bins=ef_bins_use
+        )
+        num_classes = len(classes)
+        print(f"    fold {fold_idx}: n_train={len(Xtr_int)}, n_test={len(Xte_int)}, "
+              f"n_features={Xtr_int.shape[1]}, n_classes={num_classes}")
+        folds.append((fold_idx, Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes))
+
+    return folds
+
+
+def prepare_dataset(dataset_spec: dict, ef_bins: int = 12,
+                    random_state: int = 2025) -> tuple:
+    """
+    Single train/test split (fold 0). Thin wrapper over prepare_dataset_folds for
+    callers that only need one split (e.g. reconstruct_from_diagnostics).
+    Returns (Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes).
+    """
+    folds = prepare_dataset_folds(dataset_spec, num_folds=1, ef_bins=ef_bins,
+                                  random_state=random_state)
+    _, Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes = folds[0]
     return Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes
 
 
@@ -830,8 +857,17 @@ def run_single_ablation(config_name: str, config_params: dict,
 def run_ablation_study(dataset_specs: list, out_dir: Path,
                        configs: dict | None = None,
                        shared_params: dict | None = None,
-                       model: str = "fedganblr") -> pd.DataFrame:
-    """Run ablation study across datasets and configurations."""
+                       model: str = "fedganblr",
+                       num_folds: int = 1) -> pd.DataFrame:
+    """
+    Run ablation study across datasets and configurations.
+
+    num_folds > 1 repeats every (dataset, config) across that many stratified
+    train/test splits, so downstream aggregation can report mean ± std and tell
+    real component effects from fold noise. Rich diagnostics (round stats, saved
+    model) are written only for fold 0 to keep the on-disk layout stable; metrics
+    are collected for every fold.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _, default_configs, default_shared = MODEL_REGISTRY.get(model, MODEL_REGISTRY["fedganblr"])
@@ -840,7 +876,8 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
     if shared_params is None:
         shared_params = dict(default_shared)
 
-    print(f"\n  Model: {model}  |  Configs: {list(configs.keys())}")
+    num_folds = max(1, int(num_folds))
+    print(f"\n  Model: {model}  |  Folds: {num_folds}  |  Configs: {list(configs.keys())}")
 
     all_results = []
 
@@ -851,26 +888,31 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
         print(f"{'='*60}")
 
         try:
-            Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes = prepare_dataset(spec)
+            folds = prepare_dataset_folds(spec, num_folds=num_folds)
         except Exception as e:
             print(f"  Skipping {name}: {e}")
             continue
 
         diag_root = out_dir / "diagnostics" / name
 
-        for config_name, config_params in configs.items():
-            result = run_single_ablation(
-                config_name=config_name,
-                config_params=config_params,
-                Xtr_int=Xtr_int, ytr_int=ytr_int,
-                Xte_int=Xte_int, yte_int=yte_int,
-                card_feat=card_feat, num_classes=num_classes,
-                shared_params=shared_params,
-                diagnostics_root=diag_root,
-                model=model,
-            )
-            result["dataset"] = name
-            all_results.append(result)
+        for fold_idx, Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes in folds:
+            if num_folds > 1:
+                print(f"\n  --- {name}: fold {fold_idx + 1}/{num_folds} ---")
+            for config_name, config_params in configs.items():
+                result = run_single_ablation(
+                    config_name=config_name,
+                    config_params=config_params,
+                    Xtr_int=Xtr_int, ytr_int=ytr_int,
+                    Xte_int=Xte_int, yte_int=yte_int,
+                    card_feat=card_feat, num_classes=num_classes,
+                    shared_params=shared_params,
+                    # Rich diagnostics only for fold 0 (keeps reconstruct/convergence layout)
+                    diagnostics_root=(diag_root if fold_idx == 0 else None),
+                    model=model,
+                )
+                result["dataset"] = name
+                result["fold"] = fold_idx
+                all_results.append(result)
 
     df = pd.DataFrame(all_results)
     csv_path = out_dir / "ablation_results.csv"
@@ -879,8 +921,26 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
     return df
 
 
+def _collapse_folds(df: pd.DataFrame) -> pd.DataFrame:
+    """Average metrics over folds so there is one row per (dataset, config_name).
+
+    No-op when there is no 'fold' column / already one row per (dataset, config).
+    Used to feed the per-dataset charts and delta tables, which assume a single
+    row per (dataset, config).
+    """
+    if "config_name" not in df.columns:
+        return df
+    keys = [k for k in ("dataset", "config_name") if k in df.columns]
+    metric_cols = [c for c in df.columns
+                   if c.startswith(("acc_", "nll_")) or c == "train_time_sec"]
+    if not metric_cols:
+        return df
+    return df.groupby(keys, sort=False)[metric_cols].mean().reset_index()
+
+
 def compute_ablation_deltas(df_ablation: pd.DataFrame) -> pd.DataFrame:
     """Compute differences from baseline for each configuration."""
+    df_ablation = _collapse_folds(df_ablation)  # average folds first if present
     rows = []
     metric_cols = [c for c in df_ablation.columns if c.startswith(("acc_", "nll_"))]
 
@@ -936,6 +996,7 @@ def plot_ablation_bar_chart(df_ablation: pd.DataFrame, out_dir: Path,
     metric_type: 'acc' or 'nll'
     """
     _setup_style()
+    df_ablation = _collapse_folds(df_ablation)  # average folds -> one bar per config
     datasets = df_ablation["dataset"].unique()
     n_datasets = len(datasets)
     metric_cols = [f"{metric_type}_{c}" for c in CLASSIFIERS]
@@ -1061,12 +1122,29 @@ def compute_dataset_average(df_ablation: pd.DataFrame, out_dir: Path) -> pd.Data
         print("  Dataset average: skipped (no metric columns or config_name)")
         return pd.DataFrame()
 
-    n_datasets = int(df_ablation["dataset"].nunique()) if "dataset" in df_ablation.columns else 1
+    has_ds = "dataset" in df_ablation.columns
+    n_datasets = int(df_ablation["dataset"].nunique()) if has_ds else 1
 
-    # sort=False keeps the configuration order from ABLATION_CONFIGS
-    grouped = df_ablation.groupby("config_name", sort=False)
+    # --- Step 1: collapse folds -> one mean per (dataset, config) ---
+    unit_keys = ["dataset", "config_name"] if has_ds else ["config_name"]
+    per_unit = df_ablation.groupby(unit_keys, sort=False)[metric_cols].mean().reset_index()
+
+    # Typical within-(dataset) fold noise: std over folds, averaged across datasets.
+    fold_counts = df_ablation.groupby(unit_keys, sort=False).size()
+    n_folds = int(fold_counts.max()) if len(fold_counts) else 1
+    if n_folds > 1:
+        fold_std = (df_ablation.groupby(unit_keys, sort=False)[metric_cols]
+                    .std(ddof=1)
+                    .groupby(level="config_name" if has_ds else None, sort=False).mean()
+                    if has_ds else
+                    df_ablation.groupby("config_name", sort=False)[metric_cols].std(ddof=1))
+    else:
+        fold_std = per_unit.groupby("config_name", sort=False)[metric_cols].mean() * 0.0
+
+    # --- Step 2: average across datasets (each dataset weighted equally) ---
+    grouped = per_unit.groupby("config_name", sort=False)
     mean_df = grouped[metric_cols].mean()
-    std_df = grouped[metric_cols].std(ddof=0)
+    ds_std = grouped[metric_cols].std(ddof=0)  # between-dataset spread
 
     acc_cols = [c for c in metric_cols if c.startswith("acc_")]
     nll_cols = [c for c in metric_cols if c.startswith("nll_")]
@@ -1079,10 +1157,18 @@ def compute_dataset_average(df_ablation: pd.DataFrame, out_dir: Path) -> pd.Data
     sort_key = "acc_mean" if "acc_mean" in mean_df.columns else mean_df.columns[0]
     mean_df = mean_df.sort_values(sort_key, ascending=False)
 
-    # CSV with means + per-metric std across datasets
+    # Per-config scalar fold noise on the headline acc_mean metric (avg over classifiers)
+    acc_fold_noise = (fold_std[acc_cols].mean(axis=1).reindex(mean_df.index)
+                      if acc_cols and not fold_std.empty else
+                      pd.Series(0.0, index=mean_df.index))
+
+    # --- CSV: means + between-dataset std + within-dataset fold std ---
     out = mean_df.copy()
     for c in metric_cols:
-        out[f"{c}_std"] = std_df[c]
+        out[f"{c}_ds_std"] = ds_std[c]
+        if c in fold_std.columns:
+            out[f"{c}_fold_std"] = fold_std[c].reindex(mean_df.index)
+    out.insert(0, "n_folds", n_folds)
     out.insert(0, "n_datasets", n_datasets)
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "ablation_mean_across_datasets.csv"
@@ -1090,18 +1176,35 @@ def compute_dataset_average(df_ablation: pd.DataFrame, out_dir: Path) -> pd.Data
     print(f"\n  Mean-across-datasets table saved to: {csv_path}")
 
     if acc_cols:
-        show_cols = acc_cols + (["acc_mean"] if "acc_mean" in mean_df.columns else [])
-        print(f"\n{'='*60}")
-        print(f"Mean accuracy across {n_datasets} datasets (ranked, best first)")
-        print(f"{'='*60}")
-        print(mean_df[show_cols].to_string(float_format="{:.4f}".format))
+        show = mean_df[acc_cols + (["acc_mean"] if "acc_mean" in mean_df.columns else [])].copy()
+        if n_folds > 1:
+            show["±fold"] = acc_fold_noise
+        print(f"\n{'='*64}")
+        print(f"Mean accuracy across {n_datasets} datasets, {n_folds} fold(s) "
+              f"(ranked, best first)")
+        print(f"{'='*64}")
+        print(show.to_string(float_format="{:.4f}".format))
+
         best = mean_df[sort_key].idxmax()
-        print(f"\n  Best config by mean accuracy: '{best}' "
-              f"({mean_df.loc[best, sort_key]:.4f})")
+        best_val = float(mean_df.loc[best, sort_key])
+        print(f"\n  Best config by mean accuracy: '{best}' ({best_val:.4f})")
         if "baseline" in mean_df.index:
-            print(f"  Baseline mean accuracy:        "
-                  f"{mean_df.loc['baseline', sort_key]:.4f} "
+            print(f"  Baseline mean accuracy:        {float(mean_df.loc['baseline', sort_key]):.4f} "
                   f"(rank {list(mean_df.index).index('baseline') + 1}/{len(mean_df)})")
+
+        # --- Significance verdict: is the top gap larger than fold noise? ---
+        if n_folds > 1 and len(mean_df) > 1:
+            runner_up = mean_df[sort_key].iloc[1]
+            gap = best_val - float(runner_up)
+            noise = float(acc_fold_noise.loc[best]) if best in acc_fold_noise.index else 0.0
+            verdict = ("LIKELY REAL" if gap > noise else "WITHIN FOLD NOISE")
+            print(f"\n  Top-1 vs Top-2 gap = {gap:.4f}; fold noise(±) ≈ {noise:.4f} "
+                  f"-> {verdict}")
+            if gap <= noise:
+                print("  => The winner is not clearly separable from the runner-up; "
+                      "treat the top cluster as tied.")
+    else:
+        print("  (no accuracy columns to rank)")
 
     return mean_df
 
@@ -1364,6 +1467,9 @@ def main():
         p.add_argument("--num-rounds", type=int, default=10)
         p.add_argument("--num-clients", type=int, default=5)
         p.add_argument("--dir-alpha", type=float, default=0.2)
+        p.add_argument("--num-folds", type=int, default=1,
+                       help="Stratified folds per (dataset, config) for mean ± std "
+                            "and a fold-noise significance check (default: 1)")
         _add_model_arg(p)
 
     # --- ablation subcommand ---
@@ -1485,7 +1591,7 @@ def main():
         shared   = _resolve_shared(args)
         cfgs     = _resolve_configs(args)
         df = run_ablation_study(selected, out_dir, configs=cfgs, shared_params=shared,
-                                model=args.model)
+                                model=args.model, num_folds=args.num_folds)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")
@@ -1502,7 +1608,8 @@ def main():
         # Step 1: ablation
         abl_dir = out_dir / "ablation"
         df = run_ablation_study(selected, abl_dir, configs=ablation_cfgs,
-                                shared_params=shared, model=args.model)
+                                shared_params=shared, model=args.model,
+                                num_folds=args.num_folds)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, abl_dir, metric_type="acc")
         plot_ablation_bar_chart(df, abl_dir, metric_type="nll")
