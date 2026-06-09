@@ -36,7 +36,7 @@ def run_experiment_5_datasets():
         "gamma": 0.25,
         "cpt_mix": 0.6,
         "dir_alpha": 0.2,       # Non-IID Dirichlet distribution alpha
-        "eval_syn_frac": 0.5,
+        "eval_syn_frac": 1.0,
         "cap_train": None
     }
     

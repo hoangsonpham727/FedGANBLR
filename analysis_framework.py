@@ -34,6 +34,7 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 # --- Project imports (reuse existing functions, never reimplement) ---
 from evaluation import run_one_fold_fed_ganblr, _soft_clear_tf_and_ray
 from evaluation_fedstruct import run_one_fold_fed_ganblr_fedstruct
+from federated_models.FedMLE import run_one_fold_fed_mle
 from utils import (
     fetch_openml_safely,
     discretize_train_test_no_leak,
@@ -117,6 +118,22 @@ ABLATION_CONFIGS = {
 # Aliased to the single source of truth above to avoid the two sets drifting apart.
 ABLATION_CONFIGS_FEDSTRUCT = ABLATION_CONFIGS
 
+# ---------------------------------------------------------------------------
+# Ablation configs for the simple federated MLE (one-shot, server-side averaging)
+# ---------------------------------------------------------------------------
+# This model has no training-round regularisers. Its only meaningful axes are:
+#   aggregation -> "avg"   : uniform average of per-client probability tables
+#                            ("average the values at the server"), or
+#                  "counts": pool raw counts then Laplace-normalise once.
+#   k_global    -> KDB structure complexity (0 = naive Bayes, no feature parents).
+ABLATION_CONFIGS_FEDMLE = {
+    "baseline":    dict(aggregation="avg",    k_global=2),  # server averages prob tables, k=2
+    "counts_agg":  dict(aggregation="counts", k_global=2),  # pool counts then normalise
+    "naive_bayes": dict(aggregation="avg",    k_global=0),  # k=0 (Y-only parents)
+    "k1":          dict(aggregation="avg",    k_global=1),
+    "k3":          dict(aggregation="avg",    k_global=3),
+}
+
 # Map model name → (runner function, ablation configs, shared params)
 # Resolved at runtime after DEFAULT_SHARED_PARAMS_FEDSTRUCT is defined below.
 
@@ -137,7 +154,7 @@ DEFAULT_SHARED_PARAMS = dict(
     local_epochs=3,
     batch_size=512,
     disc_epochs=1,
-    eval_syn_frac=0.5,
+    eval_syn_frac=1.0,   # generate as many synthetic rows as n_train (full TSTR)
     cap_train=None,
     # kl_lambda is intentionally NOT here — each ablation config sets it explicitly
     # so the baseline vs no_kl comparison is clean.
@@ -153,7 +170,16 @@ DEFAULT_SHARED_PARAMS_FEDSTRUCT = dict(
     local_epochs=3,
     batch_size=512,
     disc_epochs=1,
-    eval_syn_frac=0.5,
+    eval_syn_frac=1.0,   # generate as many synthetic rows as n_train (full TSTR)
+    cap_train=None,
+)
+
+# Simple federated MLE is one-shot: no training rounds / adversarial knobs.
+DEFAULT_SHARED_PARAMS_FEDMLE = dict(
+    k_global=2,
+    num_clients=5,
+    dir_alpha=0.2,
+    eval_syn_frac=1.0,   # generate n_train synthetic rows
     cap_train=None,
 )
 
@@ -161,6 +187,7 @@ DEFAULT_SHARED_PARAMS_FEDSTRUCT = dict(
 MODEL_REGISTRY = {
     "fedganblr":  (run_one_fold_fed_ganblr,          ABLATION_CONFIGS,          DEFAULT_SHARED_PARAMS),
     "fedstruct":  (run_one_fold_fed_ganblr_fedstruct, ABLATION_CONFIGS_FEDSTRUCT, DEFAULT_SHARED_PARAMS_FEDSTRUCT),
+    "fedmle":     (run_one_fold_fed_mle,              ABLATION_CONFIGS_FEDMLE,    DEFAULT_SHARED_PARAMS_FEDMLE),
 }
 
 # ---------------------------------------------------------------------------
@@ -816,10 +843,9 @@ def run_single_ablation(config_name: str, config_params: dict,
         diag_dir = diagnostics_root / config_name
         diag_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"    [{model}] config '{config_name}': "
-          f"gamma={merged.get('gamma')}, kl_lambda={merged.get('kl_lambda')}, "
-          f"beta_pow={merged.get('beta_pow')}, use_theta_weights={merged.get('use_theta_weights')}, "
-          f"cpt_mix={merged.get('cpt_mix')}")
+    # Show the knobs that actually differ for this config (model-agnostic)
+    cfg_summary = ", ".join(f"{k}={v}" for k, v in config_params.items())
+    print(f"    [{model}] config '{config_name}': {cfg_summary}")
 
     t0 = time.time()
     try:
@@ -898,6 +924,9 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
         for fold_idx, Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes in folds:
             if num_folds > 1:
                 print(f"\n  --- {name}: fold {fold_idx + 1}/{num_folds} ---")
+            # Same client partition for every config in this fold (paired comparison);
+            # different folds get a distinct, reproducible split.
+            fold_shared = {**shared_params, "split_seed": 1000 + fold_idx}
             for config_name, config_params in configs.items():
                 result = run_single_ablation(
                     config_name=config_name,
@@ -905,7 +934,7 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
                     Xtr_int=Xtr_int, ytr_int=ytr_int,
                     Xte_int=Xte_int, yte_int=yte_int,
                     card_feat=card_feat, num_classes=num_classes,
-                    shared_params=shared_params,
+                    shared_params=fold_shared,
                     # Rich diagnostics only for fold 0 (keeps reconstruct/convergence layout)
                     diagnostics_root=(diag_root if fold_idx == 0 else None),
                     model=model,
@@ -1306,7 +1335,7 @@ def emit_dataset_average(df: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def reconstruct_from_diagnostics(diagnostics_root: Path, out_dir: Path,
-                                  eval_syn_frac: float = 0.5) -> pd.DataFrame:
+                                  eval_syn_frac: float = 1.0) -> pd.DataFrame:
     """
     Walk diagnostics_root/{dataset}/{config}/final_global_model.json,
     regenerate synthetic data from each saved model, evaluate TSTR metrics,
@@ -1487,7 +1516,7 @@ def main():
                        help="Root diagnostics directory")
     p_rec.add_argument("--output-dir", type=str,
                        default=str(DEFAULT_OUTPUT_DIR / "ablation"))
-    p_rec.add_argument("--eval-syn-frac", type=float, default=0.5)
+    p_rec.add_argument("--eval-syn-frac", type=float, default=1.0)
 
     # --- charts subcommand ---
     p_charts = subparsers.add_parser(

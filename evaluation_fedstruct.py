@@ -16,7 +16,8 @@ def run_one_fold_fed_ganblr_fedstruct(
     cpt_mix=0.25, beta_pow=0.5, kl_lambda=0.5,
     use_theta_weights=True, alpha_mix=0.5, tau_floor=1e-6,
     cap_train=None, clf="lr", verbose=False,
-    eval_syn_frac: float = 0.5,
+    eval_syn_frac: float = 1.0,
+    split_seed: int = 42,
     ray_local_mode: bool = True,
     diagnostics_dir: str | Path | None = None
 ):
@@ -30,7 +31,9 @@ def run_one_fold_fed_ganblr_fedstruct(
 
     # Note: We do NOT use derive_global_meta now. 
     # Structure is learned during Round 1.
-    clients_data = dirichlet_split(Xtr_int, ytr_int, num_clients=num_clients, alpha=dir_alpha)
+    # Deterministic client partition (paired across configs for a given split_seed).
+    clients_data = dirichlet_split(Xtr_int, ytr_int, num_clients=num_clients, alpha=dir_alpha,
+                                   rng=np.random.default_rng(int(split_seed)))
 
     diag_dir = Path(diagnostics_dir) if diagnostics_dir is not None else None
     if diag_dir:

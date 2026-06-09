@@ -327,13 +327,15 @@ def run_one_fold_fed_ganblr(
     cpt_mix=0.25, beta_pow=0.5, kl_lambda=0.5,
     use_theta_weights=True, alpha_mix=0.5, tau_floor=1e-6,
     cap_train=None, clf="lr", verbose=False,
-    eval_syn_frac: float = 0.5,
+    eval_syn_frac: float = 1.0,
+    split_seed: int = 42,
     ray_local_mode: bool = False,
     diagnostics_dir: str | Path | None = None
 ):
     """
     Run one federated simulation on this fold and return TSTR metrics.
-    eval_syn_frac: fraction of training size to sample for synthetic evaluation (<=1.0).
+    eval_syn_frac: fraction of training size to sample for synthetic evaluation
+                   (<=1.0; default 1.0 => generate exactly n_train synthetic rows).
     ray_local_mode: use Ray local_mode to reduce process/memory overhead.
     """
     if cap_train is not None and len(Xtr_int) > cap_train:
@@ -345,7 +347,10 @@ def run_one_fold_fed_ganblr(
     train_arr, test_arr = build_full_table(ytr_int, yte_int, Xtr_int, Xte_int)
     card_glob, parents_glob, y_index_glob = derive_global_meta(train_arr, card_all, y_index, k=k_global)
 
-    clients_data = dirichlet_split(Xtr_int, ytr_int, num_clients=num_clients, alpha=dir_alpha)
+    # Deterministic client partition: identical across configs given the same
+    # (data, split_seed) so ablation comparisons are paired on the same split.
+    clients_data = dirichlet_split(Xtr_int, ytr_int, num_clients=num_clients, alpha=dir_alpha,
+                                   rng=np.random.default_rng(int(split_seed)))
 
     diag_dir = Path(diagnostics_dir) if diagnostics_dir is not None else None
     if diag_dir:

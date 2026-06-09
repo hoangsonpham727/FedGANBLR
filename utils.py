@@ -221,7 +221,15 @@ def discretize_train_test_no_leak(X_train_df, y_train_sr, X_test_df, y_test_sr,
     Xte_int = np.hstack(Xte_blocks) if Xte_blocks else np.empty((len(X_test_df), 0), dtype=np.int32)
     return Xtr_int, Xte_int, ytr_int, yte_int, card_feat, classes
 
-def dirichlet_split(X, y, num_clients: int, alpha: float, rng=np.random.default_rng(42)):
+def dirichlet_split(X, y, num_clients: int, alpha: float, rng=None):
+    # NOTE: do NOT use a module-level default Generator here. A default like
+    # `rng=np.random.default_rng(42)` is created once at import and its state
+    # advances on every call, so successive calls (e.g. different ablation
+    # configs in one process) would get DIFFERENT partitions. Creating a fresh
+    # seed-42 generator per call makes the split reproducible and identical
+    # across configs unless the caller passes its own `rng`.
+    if rng is None:
+        rng = np.random.default_rng(42)
     X = np.asarray(X)
     y = np.asarray(y)
     classes = np.unique(y)
