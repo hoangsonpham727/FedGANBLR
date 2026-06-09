@@ -32,7 +32,7 @@ import matplotlib.gridspec as gridspec
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 # --- Project imports (reuse existing functions, never reimplement) ---
-from evaluation import run_one_fold_fed_ganblr, _soft_clear_tf_and_ray
+from evaluation import run_one_fold_fed_ganblr, run_one_fold_ganblr, _soft_clear_tf_and_ray
 from evaluation_fedstruct import run_one_fold_fed_ganblr_fedstruct
 from federated_models.FedMLE import run_one_fold_fed_mle
 from utils import (
@@ -174,6 +174,25 @@ DEFAULT_SHARED_PARAMS_FEDSTRUCT = dict(
     cap_train=None,
 )
 
+# ---------------------------------------------------------------------------
+# Bare (centralized) GANBLR — reference, not federated.
+# Only meaningful axis here is whether the adversarial round is on.
+# ---------------------------------------------------------------------------
+ABLATION_CONFIGS_GANBLR = {
+    "baseline":       dict(adversarial=True),    # GANBLR WITH adversarial rounds
+    "no_adversarial": dict(adversarial=False),   # GANBLR-nAL (generator-only CLL)
+}
+
+DEFAULT_SHARED_PARAMS_GANBLR = dict(
+    k_global=2,
+    epochs=10,            # adversarial epochs (overridden by --num-rounds if given)
+    batch_size=512,
+    disc_epochs=1,
+    warmup_epochs=1,
+    eval_syn_frac=1.0,    # generate n_train synthetic rows
+    cap_train=None,
+)
+
 # Simple federated MLE is one-shot: no training rounds / adversarial knobs.
 DEFAULT_SHARED_PARAMS_FEDMLE = dict(
     k_global=2,
@@ -188,6 +207,7 @@ MODEL_REGISTRY = {
     "fedganblr":  (run_one_fold_fed_ganblr,          ABLATION_CONFIGS,          DEFAULT_SHARED_PARAMS),
     "fedstruct":  (run_one_fold_fed_ganblr_fedstruct, ABLATION_CONFIGS_FEDSTRUCT, DEFAULT_SHARED_PARAMS_FEDSTRUCT),
     "fedmle":     (run_one_fold_fed_mle,              ABLATION_CONFIGS_FEDMLE,    DEFAULT_SHARED_PARAMS_FEDMLE),
+    "ganblr":     (run_one_fold_ganblr,              ABLATION_CONFIGS_GANBLR,    DEFAULT_SHARED_PARAMS_GANBLR),
 }
 
 # ---------------------------------------------------------------------------

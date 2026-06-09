@@ -186,197 +186,156 @@ class GANBLR:
                                   client_id: Optional[str] = None,
                                   seed_fn: Optional[Callable] = None):
         """
-        Shared adversarial training logic for both GANBLR and FedGANBLR.
-        
-        Args:
-            X: Feature matrix [N, F]
-            y: Labels [N]
-            epochs: Number of adversarial epochs
-            batch_size: Batch size for generator training
-            disc_epochs: Epochs to train discriminator each round
-            rng: Random number generator for sampling
-            rng_local: Random number generator for resampling (if None, uses rng)
-            verbose: Verbosity level
-            initial_disc_train: If True, do an initial discriminator training before the loop
-            kl_targets: Optional KL targets for federated learning
-            kl_lambda: KL regularization weight
-            s_y: Optional class weights for federated learning
-            kl_s_weights: Optional importance weights for federated learning
-            client_id: Optional client ID for logging
-            seed_fn: Optional function to generate seeds (for federated learning)
+        Adversarial training for GANBLR.
+
+        Mapping to the paper:
+          * Discriminator step  -> Eq. 7:  max_theta_d  log D(D_data) + log(1 - D(S_data))
+          * Generator step      -> Eq. 2:  max_theta_g  log P(Y_g | X_g^k) - log(1 - D(S_data))
+          * Combined game       -> Eq. 8.
+
+        Key fix vs. the previous version
+        --------------------------------
+        The -log(1 - D(S_data)) term of Eq. 2 cannot be back-propagated: forward
+        sampling (Eq. 6) is non-differentiable and the discriminator is sklearn.
+        Adding D's loss as a tf.constant therefore left the generator gradient
+        identical to the no-adversarial case (GANBLR-nAL).
+
+        The faithful realisation is to fold the adversarial pressure into the CLL
+        term as a per-row IMPORTANCE WEIGHT. With the optimal discriminator
+            D(x) = p_data(x) / (p_data(x) + p_g(x)),
+        the likelihood ratio is
+            w(x) = D(x) / (1 - D(x)) = p_data(x) / p_g(x).
+        Training log P(Y|X) weighted by w(x) pushes p_g toward p_data exactly in
+        the regions D can still separate -- the differentiable stand-in for
+        -log(1 - D(S_data)). Because the discriminator now changes WHICH rows
+        dominate the gradient, theta_g actually moves, so GANBLR != GANBLR-nAL.
         """
         if self.generator is None:
             raise RuntimeError("Generator not initialized")
-        
+
+        import tensorflow as tf
+
         N = X.shape[0]
         if rng_local is None:
             rng_local = rng
-        
-        # Initialize discriminator if not already set
-        if not hasattr(self, 'disc') or self.disc is None:
-            self.disc = _ohe_pipeline(LogisticRegression(max_iter=500, multi_class="ovr", solver="lbfgs"), step_name="lr")
-        
-        # Optional initial discriminator training (for federated learning)
-        # This is now mainly for consistency - the new implementation trains on real data directly
-        # but we keep this for any potential future use or diagnostics
-        if initial_disc_train:
-            fake0 = self._sample_full_from_gen(n=max(1, N), rng=np.random.default_rng(12345), order=self.order)
-            X_fake0 = fake0[:N, 1:].astype(np.int32)
-            X_disc0_all = np.vstack([X, X_fake0]).astype(np.int32)
-            y_disc0_all = np.concatenate([np.ones(N, dtype=np.int32), np.zeros(N, dtype=np.int32)])
-            
-            # Sample from combined dataset (consistent with main loop - uses 100% of data)
-            n_disc0 = len(X_disc0_all)
-            disc_indices0 = rng.choice(len(X_disc0_all), size=n_disc0, replace=False)
-            X_disc0 = X_disc0_all[disc_indices0]
-            y_disc0 = y_disc0_all[disc_indices0]
-            
-            # Create fresh discriminator (consistent with main loop)
-            self.disc = _ohe_pipeline(LogisticRegression(max_iter=500, multi_class="ovr", solver="lbfgs"), step_name="lr")
-            for _ in range(max(1, int(disc_epochs))):
-                self.disc.fit(X_disc0, y_disc0)
-            
-            # Compute initial discriminator predictions for diagnostics
-            # Note: In the new implementation, we don't use importance weights for resampling
-            # but we keep this for potential future use or logging
-            p_real = self.disc.predict_proba(X)[:, 1]
-            p_real = np.clip(p_real, 1e-6, 1 - 1e-6)
-            w = 1.0 - p_real
-            probs = (w / w.sum()) if w.sum() > 0 else (np.ones_like(w) / max(1, len(w)))
-        else:
-            probs = None
-        
-        # Adversarial training loop
+
+        data_real = np.column_stack([y, X]).astype(np.int32)
+
+        # discriminator: P(is_real = 1 | row)
+        if not hasattr(self, 'disc') or self.disc is None or self.disc is False:
+            self.disc = _ohe_pipeline(
+                LogisticRegression(max_iter=500, multi_class="ovr", solver="lbfgs"),
+                step_name="lr")
+
+        # generator parameter list (constrained -> softmax logits; else raw W/bias)
+        gen = self.generator
+        vars_ = ([gen.logits_y] + list(gen.logits_v.values())) if gen.constrained \
+            else ([gen.bias] + list(gen.W.values()))
+
+        # static tensors for regularisation
+        l2_tf = tf.constant(1e-5, dtype=tf.float32)
+        kl_lambda_tf = tf.constant(float(kl_lambda or 0.0), dtype=tf.float32)
+        kl_targets_tf, kl_weights_tf = {}, {}
+        if getattr(gen, "federated", False) and kl_lambda > 0.0 and kl_targets:
+            for v, arr in kl_targets.items():
+                kl_targets_tf[int(v)] = tf.constant(np.asarray(arr, np.float32))
+            if kl_s_weights:
+                for v, arr in kl_s_weights.items():
+                    kl_weights_tf[int(v)] = tf.constant(np.asarray(arr, np.float32))
+
         log_prefix = f"[Client {client_id}]" if client_id else "[GANBLR]"
         if verbose > 0:
             print(f"{log_prefix} Starting adversarial training: {epochs} epochs")
-        
-        # Import tensorflow for manual gradient computation
-        import tensorflow as tf
-        
+
         for ep in range(1, epochs + 1):
             if verbose > 0:
                 print(f"{log_prefix} Adversarial epoch {ep}/{epochs}")
-            
-            # 1) Sample synthetic data
-            if seed_fn is not None:
-                syn_full = self._sample_full_from_gen(n=N, rng=np.random.default_rng(seed_fn(ep)), order=self.order)
-            else:
-                syn_full = self._sample_full_from_gen(n=N, rng=rng, order=self.order)
-            X_fake = syn_full[:, 1:]
-            
-            # 2) Train discriminator on combined data (fresh discriminator each epoch)
-            X_disc_all = np.vstack([X, X_fake]).astype(np.int32)
-            y_disc_all = np.concatenate([np.ones(N, dtype=np.int32), np.zeros(N, dtype=np.int32)])
-            
-            # Use all combined dataset (100% sampling)
-            n_disc = len(X_disc_all)
-            disc_indices = rng.choice(len(X_disc_all), size=n_disc, replace=False)
-            X_disc = X_disc_all[disc_indices]
-            y_disc = y_disc_all[disc_indices]
-            
-            # Create fresh discriminator each epoch
-            self.disc = _ohe_pipeline(LogisticRegression(max_iter=500, multi_class="ovr", solver="lbfgs"), step_name="lr")
+
+            # -------------------------------------------------------------
+            # 1) Sample synthetic data  (Eq. 6:  S_data = G_bar(.))
+            # -------------------------------------------------------------
+            samp_rng = np.random.default_rng(seed_fn(ep)) if seed_fn is not None else rng
+            syn_full = self._sample_full_from_gen(n=N, rng=samp_rng, order=self.order)
+            X_fake = syn_full[:, 1:].astype(np.int32)
+
+            # -------------------------------------------------------------
+            # 2) Train discriminator  (Eq. 7)
+            #    real rows -> label 1 (Y_d = 1),  synthetic rows -> label 0 (Y_d = 0)
+            # -------------------------------------------------------------
+            X_disc = np.vstack([X, X_fake]).astype(np.int32)
+            y_disc = np.concatenate([np.ones(N, np.int32), np.zeros(N, np.int32)])
+            # fresh D each round; warm-starting one D across rounds also works
+            self.disc = _ohe_pipeline(
+                LogisticRegression(max_iter=500, multi_class="ovr", solver="lbfgs"),
+                step_name="lr")
             for _ in range(max(1, int(disc_epochs))):
                 self.disc.fit(X_disc, y_disc)
-            
-            # 3) Calculate generator loss using discriminator predictions on REAL data only
-            # According to documentation: discriminator outputs probability that sample is "fake"
-            # Our discriminator outputs probability of being "real" (class 1), so we interpret:
-            # p_fake = 1 - p_real (probability discriminator thinks real data is fake)
-            p_real = self.disc.predict_proba(X)[:, 1]
-            p_real = np.clip(p_real, 1e-6, 1 - 1e-6)
-            p_fake = 1.0 - p_real  # Probability discriminator thinks real data is fake
-            # Generator loss: mean of negative log of (1 - p_fake)
-            # = -mean(log(p_real))
-            # If discriminator is uncertain about real data (p_real ≈ 0.5, p_fake ≈ 0.5),
-            # this suggests generator is producing realistic data, so loss should be moderate
-            # If discriminator is confident real is real (p_real ≈ 1), loss is low (good for generator)
-            # If discriminator thinks real is fake (p_real ≈ 0), loss is high (bad for generator)
-            # This encourages generator to produce data that makes discriminator confident real data is real
-            disc_loss_np = -np.mean(np.log(p_real + 1e-8))
-            disc_loss_tf = tf.constant(disc_loss_np, dtype=tf.float32)
-            
-            # 4) Update generator with combined loss: NLL + discriminator loss
-            # Train generator on real data (not resampled) with combined loss
-            data_real = np.column_stack([y, X]).astype(np.int32)
-            
-            # Manual training step to incorporate discriminator loss
-            gen = self.generator
-            N_batch = data_real.shape[0]
-            idx_all = np.arange(N_batch)
-            rng_batch = np.random.default_rng(ep + 1000)
-            rng_batch.shuffle(idx_all)
-            
-            # Prepare KL regularization if needed
-            kl_lambda_tf = tf.constant(float(kl_lambda or 0.0), dtype=tf.float32)
-            l2_tf = tf.constant(1e-5, dtype=tf.float32)
-            
-            kl_targets_tf = {}
-            kl_weights_tf = {}
-            if gen.federated and kl_lambda > 0.0 and kl_targets:
-                for v, arr in kl_targets.items():
-                    kl_targets_tf[int(v)] = tf.constant(np.asarray(arr, dtype=np.float32), dtype=tf.float32)
-                if kl_s_weights:
-                    for v, arr in kl_s_weights.items():
-                        kl_weights_tf[int(v)] = tf.constant(np.asarray(arr, dtype=np.float32), dtype=tf.float32)
-            
-            # Train for one epoch with combined loss
-            for s in range(0, N_batch, batch_size):
-                batch = data_real[idx_all[s:s+batch_size]]
-                x_tf = tf.convert_to_tensor(batch, dtype=tf.int32)
-                
+
+            # -------------------------------------------------------------
+            # 3) Turn D's verdict on the REAL rows into importance weights.
+            #    This is the differentiable surrogate for -log(1 - D(S_data))
+            #    in Eq. 2:   w(x) = D(x) / (1 - D(x)) = p_data(x) / p_g(x).
+            # -------------------------------------------------------------
+            d_real = self.disc.predict_proba(X)[:, 1]          # D(x) = P(real | x)
+            d_real = np.clip(d_real, 1e-6, 1.0 - 1e-6)
+            w = d_real / (1.0 - d_real)                        # likelihood ratio
+            w = np.clip(w, 1e-3, 1e3)                          # guard against blow-up
+            w = w / w.mean()                                   # mean 1: keep step scale
+            probs = w / w.sum()                                # sampling distribution
+
+            # -------------------------------------------------------------
+            # 4) Generator step (Eq. 2, first term, D-reweighted).
+            #    Rows are drawn ∝ w(x), so D directly shapes theta_g's gradient.
+            #    _nll_batch returns mean NLL = -mean log P(Y|X); minimising it
+            #    maximises the CLL term of Eq. 2.
+            # -------------------------------------------------------------
+            bsz = min(batch_size, N)
+            n_steps = max(1, N // bsz)
+            step_rng = np.random.default_rng(ep + 1000)
+
+            disc_acc = 0.0
+            for _ in range(n_steps):
+                idx = step_rng.choice(N, size=bsz, replace=True, p=probs)
+                x_tf = tf.convert_to_tensor(data_real[idx], dtype=tf.int32)
+
                 with tf.GradientTape() as tape:
-                    # Standard NLL loss
-                    loss = gen._nll_batch(x_tf)
-                    
-                    # Add L2 regularization
-                    if l2_tf > 0.0:
-                        if gen.constrained:
-                            reg = tf.nn.l2_loss(gen.logits_y)
-                            for v in gen.logits_v.values():
-                                reg += tf.nn.l2_loss(v)
-                        else:
-                            reg = tf.nn.l2_loss(gen.bias)
-                            for v in gen.W.values():
-                                reg += tf.nn.l2_loss(v)
-                        loss = loss + tf.multiply(l2_tf, reg)
-                    
-                    # Add KL regularization (for federated learning)
-                    if gen.federated and kl_lambda > 0.0 and kl_targets_tf:
+                    loss = gen._nll_batch(x_tf)                # -log P(Y|X) (weighted via resampling)
+
+                    # L2 regularisation
+                    if gen.constrained:
+                        reg = tf.nn.l2_loss(gen.logits_y)
+                        for v in gen.logits_v.values():
+                            reg += tf.nn.l2_loss(v)
+                    else:
+                        reg = tf.nn.l2_loss(gen.bias)
+                        for v in gen.W.values():
+                            reg += tf.nn.l2_loss(v)
+                    loss = loss + tf.multiply(l2_tf, reg)
+
+                    # KL term (federated only) -- unchanged from your version
+                    if getattr(gen, "federated", False) and kl_lambda > 0.0 and kl_targets_tf:
                         kl_loss = tf.constant(0.0, dtype=tf.float32)
                         for v, logits in gen.logits_v.items():
                             if int(v) not in kl_targets_tf:
                                 continue
-                            theta_local = tf.nn.softmax(logits, axis=-1)
-                            theta_tgt = kl_targets_tf[int(v)]
-                            theta_local = tf.clip_by_value(theta_local, 1e-8, 1.0)
-                            theta_tgt = tf.clip_by_value(theta_tgt, 1e-8, 1.0)
-                            if int(v) in kl_weights_tf:
-                                W = kl_weights_tf[int(v)]
-                            else:
-                                W = tf.ones_like(theta_local)
-                            el = theta_local * (tf.math.log(theta_local) - tf.math.log(theta_tgt))
-                            el = W * el
-                            kl_rows = tf.reduce_sum(el, axis=1)
-                            kl_v = tf.reduce_mean(kl_rows)
-                            kl_loss += kl_v
+                            theta_local = tf.clip_by_value(tf.nn.softmax(logits, axis=-1), 1e-8, 1.0)
+                            theta_tgt = tf.clip_by_value(kl_targets_tf[int(v)], 1e-8, 1.0)
+                            W = kl_weights_tf.get(int(v), tf.ones_like(theta_local))
+                            el = W * (theta_local * (tf.math.log(theta_local) - tf.math.log(theta_tgt)))
+                            kl_loss += tf.reduce_mean(tf.reduce_sum(el, axis=1))
                         loss = loss + tf.multiply(kl_lambda_tf, kl_loss)
-                    
-                    # Add discriminator loss term (KL divergence-like term)
-                    # This encourages generator to produce realistic data
-                    loss = loss + disc_loss_tf
-                
-                # Compute gradients and update
-                vars_ = ([gen.logits_y] + list(gen.logits_v.values())) if gen.constrained else ([gen.bias] + list(gen.W.values()))
+
+                    # NOTE: no additive disc_loss constant here -- the adversarial
+                    # signal now lives in `probs`, which controls the gradient.
+
                 grads = tape.gradient(loss, vars_)
                 gen.opt.apply_gradients(zip(grads, vars_))
-            
-            if verbose > 0:
-                acc_disc_real = float(np.mean(self.disc.predict(X) == 1))
-                disc_loss_val = float(disc_loss_np)
-                print(f"{log_prefix} Epoch {ep}/{epochs} completed: D-acc(real)={acc_disc_real:.4f} disc_loss={disc_loss_val:.4f}")
 
+            if verbose > 0:
+                disc_acc = float(np.mean((d_real >= 0.5).astype(np.int32) == 1))
+                print(f"{log_prefix} Epoch {ep}/{epochs}: "
+                      f"D-acc(real)={disc_acc:.4f}  w[min/mean/max]="
+                      f"{w.min():.3f}/{w.mean():.3f}/{w.max():.3f}")
     def _sample_full_from_gen(self, n: int, rng: np.random.Generator, order: Optional[list[int]] = None) -> np.ndarray:
         """
         Delegate full-table sampling to the constrained DiscBN_KDB generator.

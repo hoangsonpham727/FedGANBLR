@@ -320,6 +320,53 @@ def _eval_fidelity_coverage_privacy(real_df: pd.DataFrame, syn_df: pd.DataFrame)
     return dict(fidelity_col=col_fid, fidelity_row=row_fid, fidelity_agg=agg_fid, coverage=coverage, privacy_dcr=dcr)
 
 
+def run_one_fold_ganblr(
+    Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
+    k_global=2, epochs=10, batch_size=512, disc_epochs=1, warmup_epochs=1,
+    adversarial=True, eval_syn_frac=1.0, cap_train=None, split_seed=42,
+    num_rounds=None, verbose=False, diagnostics_dir=None, ray_local_mode=False,
+    **_ignored,
+):
+    """
+    Bare (centralized) GANBLR — NOT federated. Trains a single GANBLR on the full
+    training fold and runs TSTR. With adversarial=True it uses the adversarial
+    round (discriminator likelihood-ratio importance weighting); adversarial=False
+    is GANBLR-nAL (generator-only CLL).
+
+    This is the centralized reference for the federated variants. `num_rounds`
+    (if passed by the ablation harness) is interpreted as adversarial epochs.
+    Extra federated-only kwargs (num_clients, dir_alpha, gamma, kl_lambda, ...)
+    are absorbed via **_ignored.
+    """
+    import time
+    import warnings
+    from base_models.Ganblr import GANBLR
+
+    t0 = time.time()
+    if cap_train is not None and len(Xtr_int) > cap_train:
+        sel = np.random.default_rng(1).choice(len(Xtr_int), size=cap_train, replace=False)
+        Xtr_int = Xtr_int[sel]; ytr_int = ytr_int[sel]
+
+    eps = int(num_rounds) if num_rounds is not None else int(epochs)
+    try:
+        model = GANBLR(adversarial=bool(adversarial), seed=int(split_seed))
+        model.fit(Xtr_int, ytr_int, k=int(k_global), epochs=eps,
+                  batch_size=int(batch_size), disc_epochs=int(disc_epochs),
+                  warmup_epochs=int(warmup_epochs), verbose=1 if verbose else 0,
+                  adversarial=bool(adversarial))
+        n_syn = max(1, int(len(Xtr_int) * float(eval_syn_frac)))
+        X_syn, y_syn = model.sample(size=n_syn)
+        ev = _evaluate_synthetic_classifiers(X_syn, y_syn, Xte_int, yte_int)
+    except Exception as e:
+        warnings.warn(f"[run_one_fold_ganblr] failed: {e}")
+        ev = {f"acc_{c}": np.nan for c in ("lr", "mlp", "rf", "xgb")}
+        ev.update({f"nll_{c}": np.nan for c in ("lr", "mlp", "rf", "xgb")})
+
+    out = dict(train_time_sec=time.time() - t0)
+    out.update(ev)
+    return out
+
+
 def run_one_fold_fed_ganblr(
     Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
     k_global=2, num_clients=5, num_rounds=5, dir_alpha=0.1,
