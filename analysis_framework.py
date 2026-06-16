@@ -70,9 +70,7 @@ DEFAULT_OUTPUT_DIR = Path("analysis_output")
 # The configs are grouped so each group answers one analysis question. Default
 # component values when a key is omitted come from the runner signature.
 #
-# NEW BASELINE = the recommended light config from the previous ablation
-# (alpha_dir removed entirely). Every other config is exactly one step away from
-# it, so the run answers: "is this baseline the best, or does some neighbour win?"
+# NEW BASELINE 
 #   gamma=0.5  (server KL agg, slightly stronger) | kl_lambda=0.5 (client KL prox)
 #   beta_pow=0.5 + use_theta_weights=True (parameter-based importance weighting)
 #   cpt_mix=0.0 (post-training CPT mixing OFF by default)
