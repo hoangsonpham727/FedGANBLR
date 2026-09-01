@@ -120,9 +120,19 @@ def _mixture_kl_weights_with_theta(counts_loc: dict[int, np.ndarray],
                         tau: float = 1e-6) -> dict[int, np.ndarray]:
     """
     Compute per-row normalized weights s[v] for KL weighting using model parameters.
-    
-    If theta_loc is provided, uses mixture of local vs global θ parameters directly.
-    Otherwise falls back to the original counts-based approach for backward compatibility.
+
+    NOTE on how this behaves in the federated loop: the only caller passes a theta_loc
+    read off the generator, and the generator is initialised from thetas_glob immediately
+    beforehand, so theta_loc == thetas_glob and the mixture collapses to
+        mix = alpha_mix*theta_glob + (1-alpha_mix)*theta_glob = theta_glob
+        W   = theta_glob^(-beta)
+    i.e. this arm is a GLOBAL RARITY PRIOR and alpha_mix has no effect on it. That is a
+    legitimate weighting scheme and a real contrast against the counts arm
+    (_mixture_kl_weights), which does form a genuine local-vs-global mixture -- but the
+    two arms differ in the SOURCE of the local reference, not merely in its encoding.
+    Do not "fix" this by feeding in counts-derived thetas: Laplace-normalised counts are
+    bit-for-bit what _mixture_kl_weights already computes, so that collapses the two
+    arms into one and silently removes the iw_counts ablation axis.
     
     Args:
         counts_loc: dict[v] -> counts array [num_cfg, r_v] (used only for keys if theta_loc provided)
@@ -338,7 +348,8 @@ def aggregate_models(client_models: List[Dict[str, Any]],
                     card: List[int],
                     parents_full: Dict[int, List[int]],
                     y_index: int,
-                    s_y: np.ndarray | None = None) -> Dict[str, Any]:
+                    s_y: np.ndarray | None = None,
+                    normalize_kl: bool = True) -> Dict[str, Any]:
     """
     Weighted aggregation in probability space using s_y-weighted KL-based weights.
     client_models[i] contains: 'py', 'thetas', 'n'
@@ -367,15 +378,29 @@ def aggregate_models(client_models: List[Dict[str, Any]],
             accum += v
         ref_vec = accum / float(len(client_models))
 
-    weights_raw, kls = [], []
+    kls = []
     for cm in client_models:
         kl_val = float(cm.get("kl_summary", np.nan))
         if not np.isfinite(kl_val):
             v = _concatenate_model_vector_weighted(cm['py'], cm['thetas'], parents_full, y_index, card, s_y)
             kl_val = _kl(v, ref_vec)
         kls.append(kl_val)
-        weights_raw.append(cm['n'] * math.exp(-gamma * kl_val))
-    weights_raw = np.asarray(weights_raw, dtype=np.float64)
+    kl_arr = np.asarray(kls, dtype=np.float64)
+
+    # The KL above is a MEAN-per-row divergence (the concatenated CPT vector is
+    # normalised over every row), so its raw magnitude is ~1e-4 once clients warm-start
+    # from the global model. exp(-gamma * 1e-4) ~= 1 for any sane gamma, which silently
+    # collapsed this whole mechanism to plain n-weighted FedAvg. Dividing by the round's
+    # mean makes gamma scale-free: gamma=0 -> n-weighted FedAvg; gamma=1 -> a client one
+    # KL-unit above the round average is down-weighted by e^-1, whatever the units.
+    if normalize_kl:
+        kl_ref = float(np.nanmean(kl_arr)) if kl_arr.size else 0.0
+        kl_scaled = (kl_arr / kl_ref) if kl_ref > 1e-12 else np.zeros_like(kl_arr)
+    else:
+        kl_scaled = kl_arr
+    gamma_mult = np.exp(-float(gamma) * kl_scaled)
+    ns = np.asarray([cm['n'] for cm in client_models], dtype=np.float64)
+    weights_raw = ns * gamma_mult
     weights = (np.ones_like(weights_raw) / len(weights_raw)) if weights_raw.sum() == 0 else (weights_raw / weights_raw.sum())
 
     # Aggregate py
@@ -400,6 +425,7 @@ def aggregate_models(client_models: List[Dict[str, Any]],
         "thetas": thetas_global,
         "weights": weights,
         "client_kls": kls,
+        "gamma_mult": gamma_mult,
         "s_y": s_y,
     }
 
@@ -482,6 +508,15 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
         alpha_mix = float(config.get("alpha_mix", 0.5))
         beta_pow = float(config.get("beta_pow", 0.5))
         tau_floor = float(config.get("tau_floor", 1e-6))
+        bootstrap = str(config.get("bootstrap", "mle")).lower()
+        warmup_epochs = _to_int(config.get("warmup_epochs", 1), 1)
+        # Warmup measured in optimiser STEPS rather than epochs. Client shards differ in
+        # size by orders of magnitude (a car client holds ~53 rows, an adult client ~4.7k),
+        # so a fixed epoch count is 2 steps on one dataset and 15k on another and the
+        # calibration does not transfer. warmup_steps > 0 overrides warmup_epochs.
+        warmup_steps = _to_int(config.get("warmup_steps", 0), 0)
+        local_lr = float(config.get("local_lr", 1e-3))
+        freeze_py = str(config.get("freeze_py", "0")).lower() in ("1", "true", "yes")
  
 
         # Parse optional global model to warm-start / form KL targets
@@ -555,13 +590,41 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
                 py_glob, thetas_glob = None, None
         
         gen = DiscBN_KDB(card=card, y_index=y_index, parents=parents_excl_y, constrained=True,
-                            seed=int(self.cid) if self.cid.isdigit() else 12345, federated=True)
-        
+                            seed=int(self.cid) if self.cid.isdigit() else 12345,
+                            federated=True, lr=local_lr)
+
         if py_glob is not None and thetas_glob:
             # Initialize from global model (federated learning: start from aggregated model)
             if verbose:
                 print(f"[Client {self.cid}] Initializing from global model parameters")
             gen.init_from_params(py_glob, thetas_glob, jitter_std=0.0)
+        elif bootstrap == "warmup":
+            # Original-GANBLR bootstrap: keep DiscBN_KDB's random init and CREATE the CPTs
+            # by discriminative (conditional-likelihood) training. Starting at the generative
+            # MLE instead -- as bootstrap="mle" does -- puts the generator at the estimator
+            # GANBLR is designed to improve on, and the short local budget then never leaves it.
+            if verbose:
+                print(f"[Client {self.cid}] Discriminative warmup bootstrap ({warmup_epochs} epochs)")
+            # Seed the class prior from local label counts, exactly as the original GANBLR
+            # does at sampling time. Without this, freeze_py would leave logits_y at its
+            # random init and the client would report a meaningless P(Y).
+            try:
+                py_loc = np.bincount(self.y, minlength=int(card[y_index])).astype(np.float64) + 1.0
+                py_loc = py_loc / py_loc.sum()
+                gen.logits_y.assign(tf.math.log(tf.constant(py_loc, dtype=tf.float32) + 1e-8))
+            except Exception:
+                pass
+            _bs = max(1, min(batch_size, train_arr.shape[0]))
+            _epochs = warmup_epochs
+            if warmup_steps > 0:
+                steps_per_epoch = max(1, int(np.ceil(N / _bs)))
+                _epochs = max(1, int(np.ceil(warmup_steps / steps_per_epoch)))
+            if verbose:
+                print(f"[Client {self.cid}] warmup epochs={_epochs} (n={N}, bs={_bs})")
+            if _epochs > 0 and N > 0:
+                gen.fit(train_arr, epochs=int(_epochs), batch_size=_bs,
+                        l2=1e-5, verbose=1 if verbose else 0,
+                        kl_lambda=0.0, freeze_py=freeze_py)
         else:
             # Initialize from MLE for first round (no global model available)
             if verbose:
@@ -585,21 +648,26 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
             counts_loc = _local_cpt_counts(train_arr, card, y_index, parents_full)
             
             if use_theta_weights:
-                # COMPUTE WEIGHTS USING MODEL PARAMETERS (thetas)
-                # Extract local CPTs from current generator parameters (logits -> softmax)
+                # ARM A -- weights from MODEL PARAMETERS. This block only runs when a
+                # global model exists (rounds >= 2), and the generator was initialised
+                # from it a few lines above, so theta_loc == thetas_glob and the mixture
+                # reduces to W = theta_glob^(-beta): a GLOBAL RARITY PRIOR that up-weights
+                # cells the global model thinks are rare. alpha_mix is inert in this arm
+                # by construction -- see the note on _mixture_kl_weights_with_theta.
                 theta_loc = _disc_local_thetas_from_logits(gen)
-                
-                # Compute importance weights based on mixture of global vs local learned parameters
+
                 kl_s_weights = _mixture_kl_weights_with_theta(
                     counts_loc=counts_loc,
                     thetas_glob=thetas_glob,
-                    theta_loc=theta_loc,  # Pass the generator's learned parameters
+                    theta_loc=theta_loc,
                     alpha_mix=alpha_mix,
                     beta=beta_pow,
                     tau=tau_floor,
                 )
             else:
-                # COMPUTE WEIGHTS USING EMPIRICAL COUNTS
+                # ARM B -- weights from EMPIRICAL COUNTS. Genuine local-vs-global mixture
+                # (mix = alpha_mix*theta_glob + (1-alpha_mix)*p_local), so alpha_mix is
+                # live here and only here. This is the `iw_counts` ablation arm.
                 kl_s_weights = _mixture_kl_weights(
                     counts_loc, 
                     thetas_glob, 
@@ -634,6 +702,7 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
                     kl_lambda=kl_lambda,
                     s_y=s_y,
                     kl_s_weights=kl_s_weights,
+                    freeze_py=freeze_py,
                 )
                 if verbose:
                     print(f"[Client {self.cid}] Local training completed")
@@ -700,7 +769,8 @@ class GANBLRFederatedClient(fl.client.NumPyClient):
             s_y=s_y,
             kl_s_weights=kl_s_weights,
             client_id=self.cid,
-            seed_fn=_cid_seed
+            seed_fn=_cid_seed,
+            freeze_py=freeze_py,
         )
     
         # Store discriminator reference for potential future use
@@ -824,6 +894,13 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         nll_csv_path: str | None = "nll_convergence.csv",
         use_theta_weights: bool = True,
         kl_lambda: float = 0.5,
+        bootstrap: str = "mle",
+        warmup_epochs: int = 1,
+        warmup_steps: int = 0,
+        local_lr: float = 1e-3,
+        freeze_py: bool = False,
+        py_from_counts: bool = False,
+        normalize_kl: bool = True,
     ):
         super().__init__()
         self.k = int(k)
@@ -840,6 +917,15 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         self.beta_pow = float(beta_pow)
         self.tau_floor = float(tau_floor)
         self.kl_lambda = float(kl_lambda)
+        self.bootstrap = str(bootstrap).lower()
+        self.warmup_epochs = int(warmup_epochs)
+        self.warmup_steps = int(warmup_steps)
+        self.local_lr = float(local_lr)
+        self.freeze_py = bool(freeze_py)
+        self.py_from_counts = bool(py_from_counts)
+        self.normalize_kl = bool(normalize_kl)
+        # Per-round diagnostics filled in by aggregate_fit.
+        self.round_diag = {}
         # Allow disabling NLL CSV writing by passing None/"".
         self.nll_csv_path = str(nll_csv_path) if nll_csv_path else None
         self.use_theta_weights = bool(use_theta_weights)
@@ -894,6 +980,11 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
             "tau_floor": self.tau_floor,
             "use_theta_weights": self.use_theta_weights,
             "kl_lambda": self.kl_lambda,
+            "bootstrap": self.bootstrap,
+            "warmup_epochs": self.warmup_epochs,
+            "warmup_steps": self.warmup_steps,
+            "local_lr": self.local_lr,
+            "freeze_py": 1 if self.freeze_py else 0,
             # Set verbose to 0 to keep client-side training quiet
             "verbose": 0,
         }
@@ -1031,6 +1122,7 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
                         continue
 
                 client_models.append({
+                    "cid": str(client_id),
                     "py": py,
                     "thetas": thetas,
                     "n": n_local,
@@ -1046,6 +1138,15 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
         if not client_models:
             return fl.common.ndarrays_to_parameters([]), {}
 
+        # Flower returns results in completion order, which reshuffles every round. All
+        # the per-client arrays we emit (weights, client_ns, client_kls) are positional,
+        # so without this sort position i means a different client each round and the
+        # weight-stability diagnostics measure shuffling rather than any real movement.
+        def _cid_key(cm):
+            c = cm.get("cid", "")
+            return (0, int(c)) if str(c).isdigit() else (1, str(c))
+        client_models.sort(key=_cid_key)
+
         # Compute s_y from client label marginals (n-weighted); fallback to uniform
         if label_margs and sum(ns) > 0:
             s_y = np.sum(np.stack(label_margs, axis=0), axis=0)
@@ -1054,12 +1155,53 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
             C = card[y_index]
             s_y = np.ones(C, dtype=np.float64) / max(1, C)
 
+        # Keep the model each client STARTED from, so we can measure how far local
+        # training actually moved it (theta_drift below).
+        prev_global = self.global_model
+
         # KL-weighted aggregation using s_y
         self.global_model = aggregate_models(client_models, self.gamma, self.global_model,
-                                             card=card, parents_full=parents_full, y_index=y_index, s_y=s_y)
+                                             card=card, parents_full=parents_full, y_index=y_index,
+                                             s_y=s_y, normalize_kl=self.normalize_kl)
 
         # Attach s_y for inspection
         self.global_model["s_y"] = s_y
+
+        # C3: s_y is already the n-weighted pool of the client label marginals, i.e. the
+        # exact pooled empirical class prior. The conditional objective cannot identify
+        # P(Y), so prefer the pooled counts over the aggregated learned prior.
+        if self.py_from_counts:
+            self.global_model["py"] = np.asarray(s_y, dtype=np.float64).copy()
+
+        # --- C6 diagnostics -------------------------------------------------------
+        # theta_drift: max/mean over clients of max |theta_client - theta_global_start|.
+        # If this is ~0 the local round did nothing, and no component that reacts to
+        # client divergence (gamma, kl_lambda, importance weighting) can possibly matter.
+        theta_drift_max = float("nan")
+        theta_drift_mean = float("nan")
+        if prev_global is not None and prev_global.get("thetas"):
+            per_client = []
+            for cm in client_models:
+                d = [float(np.max(np.abs(cm["thetas"][v] - prev_global["thetas"][v])))
+                     for v in cm["thetas"]
+                     if v in prev_global["thetas"]
+                     and np.shape(cm["thetas"][v]) == np.shape(prev_global["thetas"][v])]
+                if d:
+                    per_client.append(max(d))
+            if per_client:
+                theta_drift_max = float(np.max(per_client))
+                theta_drift_mean = float(np.mean(per_client))
+        gmult = np.asarray(self.global_model.get("gamma_mult", []), dtype=np.float64)
+        # Distance of the global class prior from the pooled empirical prior.
+        py_l1_error = float(np.abs(np.asarray(self.global_model["py"], dtype=np.float64)
+                                   - np.asarray(s_y, dtype=np.float64)).sum())
+        self.round_diag[int(rnd)] = {
+            "theta_drift_max": theta_drift_max,
+            "theta_drift_mean": theta_drift_mean,
+            "gamma_mult_min": float(np.min(gmult)) if gmult.size else float("nan"),
+            "gamma_mult_max": float(np.max(gmult)) if gmult.size else float("nan"),
+            "py_l1_error": py_l1_error,
+        }
         
         # Store model snapshot for this round (deep copy to avoid reference issues)
         import copy
@@ -1070,7 +1212,9 @@ class KDBGANStrategy(fl.server.strategy.FedAvg):
             "weights": np.copy(self.global_model.get("weights", np.array([]))) if isinstance(self.global_model.get("weights"), np.ndarray) else self.global_model.get("weights"),
             "client_kls": np.copy(self.global_model.get("client_kls", np.array([]))) if isinstance(self.global_model.get("client_kls"), (list, np.ndarray)) else self.global_model.get("client_kls"),
             "client_ns": np.asarray([cm.get("n", 0) for cm in client_models], dtype=np.int64),
+            "client_cids": [cm.get("cid", "") for cm in client_models],
             "nll_clients": len(nll_data),
+            **self.round_diag[int(rnd)],
         }
         
         # Log NLL values to CSV file (when enabled)

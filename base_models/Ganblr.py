@@ -184,7 +184,8 @@ class GANBLR:
                                   s_y: Optional[np.ndarray] = None,
                                   kl_s_weights: Optional[dict[int, np.ndarray]] = None,
                                   client_id: Optional[str] = None,
-                                  seed_fn: Optional[Callable] = None):
+                                  seed_fn: Optional[Callable] = None,
+                                  freeze_py: bool = False):
         """
         Adversarial training for GANBLR.
 
@@ -229,8 +230,7 @@ class GANBLR:
 
         # generator parameter list (constrained -> softmax logits; else raw W/bias)
         gen = self.generator
-        vars_ = ([gen.logits_y] + list(gen.logits_v.values())) if gen.constrained \
-            else ([gen.bias] + list(gen.W.values()))
+        vars_ = gen._trainable_vars(freeze_py)
 
         # static tensors for regularisation
         l2_tf = tf.constant(1e-5, dtype=tf.float32)

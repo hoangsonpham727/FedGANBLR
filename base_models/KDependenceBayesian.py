@@ -311,7 +311,8 @@ class DiscBN_KDB:
     Trains by minimizing conditional NLL (softmax over classes).
     """
     
-    def __init__(self, card: List[int], y_index: int, parents: Dict[int, List[int]], constrained: bool = True, federated: bool = False,  seed: int = 123):
+    def __init__(self, card: List[int], y_index: int, parents: Dict[int, List[int]], constrained: bool = True, federated: bool = False,  seed: int = 123,
+                 lr: float = 1e-3):
         self.card = card; self.y_index = y_index; self.parents = parents; self.constrained = constrained
         tf.random.set_seed(seed)
         
@@ -353,7 +354,8 @@ class DiscBN_KDB:
                 init = tf.random.normal([num_cfg, rv, C], stddev=0.01, dtype=tf.float32)
                 self.W[v] = tf.Variable(init)
             self.logits_y = None; self.logits_v = None
-        self.opt = keras.optimizers.Adam(learning_rate=1e-3)
+        self.lr = float(lr)
+        self.opt = keras.optimizers.Adam(learning_rate=self.lr)
 
     def init_from_mle(self, mle: 'MLE_KDB', jitter_std: float = 0.0):
         assert self.constrained, "init_from_mle only for constrained mode"
@@ -573,7 +575,7 @@ class DiscBN_KDB:
 
     def fit(self, data: np.ndarray, epochs: int = 60, batch_size: int = 1024, l2: float = 1e-5, verbose: int = 0,
             kl_targets: Dict[int, np.ndarray] | None = None, kl_lambda: float = 0.0, s_y: np.ndarray | None = None,
-            kl_s_weights: Dict[int, np.ndarray] | None = None):
+            kl_s_weights: Dict[int, np.ndarray] | None = None, freeze_py: bool = False):
         N = data.shape[0]; idx_all = np.arange(N)
         # prepare targets
         kl_lambda = float(kl_lambda or 0.0)
@@ -637,7 +639,7 @@ class DiscBN_KDB:
                             kl_v = tf.reduce_mean(kl_rows)
                             kl_loss += kl_v
                         loss = loss + tf.multiply(kl_lambda_tf, kl_loss)
-                vars_ = ([self.logits_y] + list(self.logits_v.values())) if self.constrained else ([self.bias] + list(self.W.values()))
+                vars_ = self._trainable_vars(freeze_py)
                 grads = tape.gradient(loss, vars_)
                 self.opt.apply_gradients(zip(grads, vars_))
                 # Store loss value for logging (only at end of epoch to minimize blocking)
@@ -653,6 +655,20 @@ class DiscBN_KDB:
                 elif ep % max(1, epochs//5) == 0 or ep == epochs-1:
                     # Fallback if loss_value wasn't captured
                     print(f"[DiscBN_KDB] Epoch {ep+1}/{epochs} completed")
+
+    def _trainable_vars(self, freeze_py: bool = False):
+        """Variables handed to the optimizer.
+
+        freeze_py drops the class-prior parameter. The original GANBLR never learns
+        P(Y) (it reads the empirical class counts at sampling time); the conditional
+        objective optimised here cannot identify P(Y) anyway, so training it only adds
+        drift.
+        """
+        if self.constrained:
+            base = list(self.logits_v.values())
+            return base if freeze_py else ([self.logits_y] + base)
+        base = list(self.W.values())
+        return base if freeze_py else ([self.bias] + base)
 
     def predict_proba(self, data: np.ndarray) -> np.ndarray:
         x_tf = tf.convert_to_tensor(data, dtype=tf.int32)

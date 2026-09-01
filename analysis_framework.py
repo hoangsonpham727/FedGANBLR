@@ -110,6 +110,105 @@ ABLATION_CONFIGS = {
     "iw_counts":             {**_BASE, "use_theta_weights": False},
 }
 
+# ---------------------------------------------------------------------------
+# Calibration stages (added after the ablation above measured |t| < 1.4 on every
+# component, because local training was not moving the model at all).
+# ---------------------------------------------------------------------------
+# STAGE A -- does local training move? Every component is OFF here, so the only thing
+# varying is how the CPTs come into existence and how many optimiser steps they get.
+# Gate: theta_drift_max in diagnostics/<ds>/<cfg>/global_round_stats.csv must reach
+# >= 0.02, otherwise the round was a no-op and nothing downstream is testable.
+#   bootstrap="mle"    -> current behaviour: start at the generative MLE
+#   bootstrap="warmup" -> original GANBLR: random init + discriminative warmup, i.e. the
+#                         CPTs are CREATED by training instead of by counting
+# Warmup is expressed in STEPS, not epochs: client shards differ by orders of magnitude
+# (a car client holds ~53 rows, an adult client ~4.7k), so an epoch count that is 2 steps
+# on one dataset is 15k on another and the calibration does not transfer.
+_A = dict(gamma=0.0, beta_pow=0.0, cpt_mix=0.0, kl_lambda=0.0,
+          use_theta_weights=True, alpha_mix=0.5,
+          freeze_py=True, py_from_counts=True,
+          bootstrap="warmup", batch_size=32)
+
+_STAGE_A = {
+    "bootA_mle":               {**_A, "bootstrap": "mle", "batch_size": 512},
+    # HYBRID: MLE init (sane rows for classes a client never sees) + a real step budget.
+    # Restored after chess (18 classes) showed the warmup bootstrap losing 0.14-0.17 acc
+    # while nursery/car (4-5 classes) gained: the CLL null space that lets training move
+    # the joint without changing P(Y|X) grows with class count, so a random init has far
+    # more room to drift somewhere generatively bad. This cell separates "which init" from
+    # "how much movement", which bootA_mle (bs=512, lr=1e-3, drift~0.005) cannot.
+    "bootA_mle_bs32_lr1e2":    {**_A, "bootstrap": "mle", "local_lr": 1e-2},
+    "bootA_warmup_s500":       {**_A, "warmup_steps": 500},
+    "bootA_warmup_s2000":      {**_A, "warmup_steps": 2000},
+    "bootA_warmup_s2000_lr1e2": {**_A, "warmup_steps": 2000, "local_lr": 1e-2},
+    "bootA_warmup_s5000_lr1e2": {**_A, "warmup_steps": 5000, "local_lr": 1e-2},
+    # Control: let the conditional objective learn P(Y), which it cannot identify.
+    "bootA_warmup_trainpy":    {**_A, "warmup_steps": 2000, "local_lr": 1e-2,
+                                "freeze_py": False, "py_from_counts": False},
+}
+
+# STAGE B -- one component at a time from a neutral base. _B is set to the Stage-A cell
+# that passed the gate on car/nursery (drift 0.10-0.48 vs 0.004 for the MLE bootstrap);
+# re-point it if the full Stage-A run prefers a different cell.
+_B = dict(bootstrap="warmup", batch_size=32, warmup_steps=2000, local_lr=1e-2,
+          freeze_py=True, py_from_counts=True,
+          gamma=0.0, beta_pow=0.0, cpt_mix=0.0, kl_lambda=0.0,
+          use_theta_weights=True, alpha_mix=0.5)
+
+def _fmt(x):
+    return str(x).replace(".", "p").replace("-", "m")
+
+_STAGE_B = {"calB_base": {**_B}}
+_STAGE_B.update({f"calB_gamma_{_fmt(g)}": {**_B, "gamma": g} for g in (0.25, 0.5, 1.0, 2.0)})
+_STAGE_B.update({f"calB_klam_{_fmt(l)}": {**_B, "kl_lambda": l} for l in (0.1, 0.5, 1.0)})
+_STAGE_B.update({f"calB_cptmix_{_fmt(c)}": {**_B, "cpt_mix": c} for c in (0.1, 0.25, 0.6)})
+# IMPORTANCE WEIGHTING is NOT an independent component: kl_s_weights only enters the
+# loss inside the `kl_lambda > 0.0` branch (KDependenceBayesian.py:621, Ganblr.py:316).
+# With kl_lambda=0 the weights are computed, passed down, and never read. So beta_pow /
+# alpha_mix / use_theta_weights must be swept with the KL prox ON, against a
+# kl_lambda-matched reference, or the delta is unattributable.
+_IW = {**_B, "kl_lambda": 0.5}
+_STAGE_B["calB_iw_ref"] = {**_IW, "beta_pow": 0.0}          # KL prox on, weighting off
+# ARM A (use_theta_weights=True): W = theta_glob^(-beta), a global rarity prior.
+# alpha_mix is inert in this arm -- see _mixture_kl_weights_with_theta.
+_STAGE_B.update({f"calB_beta_{_fmt(b)}": {**_IW, "beta_pow": b} for b in (0.25, 0.5, 1.0)})
+# ARM B (use_theta_weights=False): genuine local-vs-global mixture from empirical counts.
+# This is the existing `iw_counts` axis, and the ONLY arm where alpha_mix does anything.
+_STAGE_B["calB_beta_0p5_counts"] = {**_IW, "beta_pow": 0.5, "use_theta_weights": False}
+_STAGE_B.update({f"calB_alphamix_{_fmt(a)}_counts":
+                 {**_IW, "beta_pow": 0.5, "use_theta_weights": False, "alpha_mix": a}
+                 for a in (0.25, 0.75)})
+# Control: gamma with the OLD un-normalised KL, which is inert by construction.
+_STAGE_B["calB_gamma_raw_0p5"] = {**_B, "gamma": 0.5, "normalize_kl": False}
+
+# Stage C (leave-one-out at the calibrated point) is deliberately NOT predefined -- its
+# values are whatever Stage B selects. Write it after reading the Stage-B table.
+
+# CONTEXT ROWS -- reported for scale, not as targets. `_model` reroutes the row to a
+# different runner in MODEL_REGISTRY while keeping the same fold and client split.
+# Exact reproduction of the pre-calibration behaviour. NOTE: "baseline" no longer
+# reproduces the numbers in analysis_output/*, because normalize_kl now defaults to
+# True (gamma was inert before) and the client init seed is now shared. Use this config
+# whenever you need to compare against the published tables.
+_LEGACY = {
+    "legacy_baseline": {**_BASE, "bootstrap": "mle", "normalize_kl": False,
+                        "freeze_py": False, "py_from_counts": False},
+    "legacy_all_off": {**_BASE, "gamma": 0.0, "beta_pow": 0.0, "kl_lambda": 0.0,
+                       "bootstrap": "mle", "normalize_kl": False,
+                       "freeze_py": False, "py_from_counts": False},
+}
+
+_CONTEXT = {
+    "ctx_fedmle_counts":  {"_model": "fedmle", "aggregation": "counts", "k_global": 2},
+    "ctx_fedmle_avg":     {"_model": "fedmle", "aggregation": "avg", "k_global": 2},
+    "ctx_central_ganblr": {"_model": "ganblr", "adversarial": False},
+}
+
+ABLATION_CONFIGS.update(_STAGE_A)
+ABLATION_CONFIGS.update(_STAGE_B)
+ABLATION_CONFIGS.update(_LEGACY)
+ABLATION_CONFIGS.update(_CONTEXT)
+
 # Ablation configs for FedStruct — identical component sweep. FedStruct adds a
 # structure-learning round (round 1) on top of the parameter rounds; the same
 # components apply to the parameter rounds and the structure round is always active.
@@ -853,9 +952,23 @@ def run_single_ablation(config_name: str, config_params: dict,
                         diagnostics_root: Path | None = None,
                         model: str = "fedganblr") -> dict:
     """Run a single ablation configuration and return results."""
-    runner, _, _ = MODEL_REGISTRY.get(model, MODEL_REGISTRY["fedganblr"])
+    # A config may reroute itself to a different runner via "_model" (context rows).
+    cfg_params = dict(config_params)
+    model_override = cfg_params.pop("_model", None)
+    use_model = model_override or model
+    runner, _, model_shared = MODEL_REGISTRY.get(use_model, MODEL_REGISTRY["fedganblr"])
 
-    merged = {**shared_params, **config_params}
+    if model_override:
+        # Context row: use that model's own defaults, but keep the knobs that define
+        # the comparison (same fold, same client partition, same synthetic budget).
+        merged = dict(model_shared)
+        for key in ("split_seed", "num_clients", "dir_alpha", "cap_train", "eval_syn_frac"):
+            if key in shared_params:
+                merged[key] = shared_params[key]
+        merged.update(cfg_params)
+    else:
+        merged = {**shared_params, **cfg_params}
+    model = use_model
     diag_dir = None
     if diagnostics_root is not None:
         diag_dir = diagnostics_root / config_name
@@ -921,9 +1034,21 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
         shared_params = dict(default_shared)
 
     num_folds = max(1, int(num_folds))
-    print(f"\n  Model: {model}  |  Folds: {num_folds}  |  Configs: {list(configs.keys())}")
+    total_runs = len(dataset_specs) * num_folds * len(configs)
+    print(f"\n  Model: {model}  |  Folds: {num_folds}  |  Configs: {len(configs)}")
+    print(f"  Total runs: {len(dataset_specs)} datasets x {num_folds} folds x "
+          f"{len(configs)} configs = {total_runs}")
 
     all_results = []
+    csv_path = out_dir / "ablation_results.csv"
+
+    def _flush():
+        """Persist after every config, so a long sweep can be inspected while it runs
+        and survives an interrupt without losing completed work."""
+        try:
+            pd.DataFrame(all_results).to_csv(csv_path, index=False)
+        except Exception as e:
+            print(f"  [warn] could not write partial results: {e}")
 
     for spec in dataset_specs:
         name = spec["name"]
@@ -960,10 +1085,11 @@ def run_ablation_study(dataset_specs: list, out_dir: Path,
                 result["dataset"] = name
                 result["fold"] = fold_idx
                 all_results.append(result)
+                _flush()
+                print(f"      [{len(all_results)}/{total_runs}] saved -> {csv_path}")
 
     df = pd.DataFrame(all_results)
-    csv_path = out_dir / "ablation_results.csv"
-    df.to_csv(csv_path, index=False)
+    _flush()
     print(f"\n  Results saved to: {csv_path}")
     return df
 
@@ -983,6 +1109,91 @@ def _collapse_folds(df: pd.DataFrame) -> pd.DataFrame:
     if not metric_cols:
         return df
     return df.groupby(keys, sort=False)[metric_cols].mean().reset_index()
+
+
+def compute_paired_stats(df_ablation: pd.DataFrame, out_dir: Path | None = None,
+                         baseline: str = "baseline") -> pd.DataFrame:
+    """Paired per-(dataset, fold) comparison of every config against `baseline`.
+
+    Every config in a fold sees the same train/test split AND the same Dirichlet client
+    partition (run_ablation_study pins split_seed = 1000 + fold_idx), so differences are
+    paired and the fold-to-fold level cancels.
+
+    Also reports the study's minimum detectable effect: with n pairs and paired SD s,
+    MDE ~ 2.8 * s / sqrt(n) at 80% power / alpha=0.05. Any |delta| below the MDE is not
+    evidence of anything, in either direction.
+    """
+    if df_ablation.empty or "config_name" not in df_ablation.columns:
+        return pd.DataFrame()
+    keys = [k for k in ("dataset", "fold") if k in df_ablation.columns]
+    if not keys:
+        return pd.DataFrame()
+    acc_cols = [c for c in df_ablation.columns if c.startswith("acc_")]
+    nll_cols = [c for c in df_ablation.columns if c.startswith("nll_")]
+    if not acc_cols:
+        return pd.DataFrame()
+
+    df = df_ablation.copy()
+    df["_acc"] = df[acc_cols].mean(axis=1)
+    if nll_cols:
+        df["_nll"] = df[nll_cols].mean(axis=1)
+    base = df[df["config_name"] == baseline].set_index(keys)
+    if base.empty:
+        print(f"  Paired stats: skipped (no '{baseline}' config)")
+        return pd.DataFrame()
+
+    rows = []
+    for cfg in df["config_name"].unique():
+        if cfg == baseline:
+            continue
+        other = df[df["config_name"] == cfg].set_index(keys)
+        idx = base.index.intersection(other.index)
+        if len(idx) < 2:
+            continue
+        rec = {"config_name": cfg, "n_pairs": int(len(idx))}
+        for label, col in (("acc", "_acc"), ("nll", "_nll")):
+            if col not in df.columns:
+                continue
+            d = (other.loc[idx, col] - base.loc[idx, col]).astype(float).values
+            d = d[np.isfinite(d)]
+            n = len(d)
+            if n < 2:
+                continue
+            m, s = float(np.mean(d)), float(np.std(d, ddof=1))
+            se = s / np.sqrt(n) if s > 0 else 0.0
+            rec[f"d_{label}"] = m
+            rec[f"sd_{label}"] = s
+            rec[f"t_{label}"] = (m / se) if se > 0 else 0.0
+            rec[f"ci_lo_{label}"] = m - 1.96 * se
+            rec[f"ci_hi_{label}"] = m + 1.96 * se
+            rec[f"mde_{label}"] = 2.8 * s / np.sqrt(n) if n else np.nan
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("d_acc", ascending=False)
+
+    print(f"\n{'='*78}")
+    print(f"Paired deltas vs '{baseline}' (mean over {', '.join(acc_cols)})")
+    print(f"{'='*78}")
+    hdr = f"{'config':<30}{'n':>4}{'dAcc':>9}{'t':>7}{'95% CI':>19}{'MDE':>8}"
+    print(hdr); print("-" * len(hdr))
+    for _, r in out.iterrows():
+        sig = "*" if abs(r.get("t_acc", 0)) >= 2.0 else " "
+        print(f"{r['config_name']:<30}{int(r['n_pairs']):>4}{r.get('d_acc', np.nan):>+9.4f}"
+              f"{r.get('t_acc', np.nan):>7.2f}"
+              f"  [{r.get('ci_lo_acc', np.nan):+.4f},{r.get('ci_hi_acc', np.nan):+.4f}]"
+              f"{r.get('mde_acc', np.nan):>8.4f}{sig}")
+    print("\n  * = |t| >= 2. Deltas smaller than MDE are below this study's resolution;")
+    print("    raise --num-folds (and/or add seed repeats) rather than reading them.")
+
+    if out_dir is not None:
+        try:
+            out.to_csv(Path(out_dir) / "ablation_paired_stats.csv", index=False)
+        except Exception as e:
+            print(f"  Could not write paired stats: {e}")
+    return out
 
 
 def compute_ablation_deltas(df_ablation: pd.DataFrame) -> pd.DataFrame:
@@ -1624,6 +1835,7 @@ def main():
         print(f"Loaded {len(df)} rows from {csv_path}")
         print(f"Datasets: {df['dataset'].unique().tolist()}")
         print(f"Configs:  {df['config_name'].unique().tolist()}")
+        compute_paired_stats(df, out_dir)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")
@@ -1639,6 +1851,7 @@ def main():
         cfgs     = _resolve_configs(args)
         df = run_ablation_study(selected, out_dir, configs=cfgs, shared_params=shared,
                                 model=args.model, num_folds=args.num_folds)
+        compute_paired_stats(df, out_dir)
         deltas = compute_ablation_deltas(df)
         plot_ablation_bar_chart(df, out_dir, metric_type="acc")
         plot_ablation_bar_chart(df, out_dir, metric_type="nll")

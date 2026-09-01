@@ -367,6 +367,97 @@ def run_one_fold_ganblr(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Federated diagnostics writers (shared by the FedGANBLR and FedStruct runners)
+# ---------------------------------------------------------------------------
+
+def write_client_split_stats(diag_dir, ytr_int, yte_int, num_classes, clients_data, meta):
+    """Dump the per-client label distribution plus the run's knobs."""
+    if diag_dir is None:
+        return
+    try:
+        client_stats = []
+        for cid, (_, yc) in enumerate(clients_data):
+            counts = np.bincount(yc, minlength=num_classes)
+            total = int(counts.sum())
+            client_stats.append({
+                "client": cid,
+                "n": total,
+                "label_counts": counts.astype(int).tolist(),
+                "label_frac": (counts / max(1, total)).tolist(),
+            })
+        payload = dict(meta)
+        payload.update({
+            "train_class_counts": np.bincount(ytr_int, minlength=num_classes).tolist(),
+            "test_class_counts": np.bincount(yte_int, minlength=num_classes).tolist(),
+            "client_splits": client_stats,
+        })
+        (Path(diag_dir) / "client_split_stats.json").write_text(json.dumps(payload, indent=2))
+    except Exception as e:
+        print(f"[diag] Failed to write client split stats: {e}")
+
+
+def write_round_diagnostics(diag_dir, strategy, gm, card_glob, parents_glob, y_index_glob,
+                            fold_config):
+    """Dump per-round global stats, the fold config, and the final global model.
+
+    The theta_drift / gamma_mult / py_l1_error columns are what make a component
+    ablation readable: if theta_drift_max is ~0 the local round did nothing, and if
+    gamma_mult_min == gamma_mult_max the KL weighting collapsed to n-weighted FedAvg.
+    """
+    if diag_dir is None:
+        return
+    diag_dir = Path(diag_dir)
+    round_rows = []
+    for rnd, snap in sorted(getattr(strategy, "model_snapshots", {}).items()):
+        row = {"round": int(rnd)}
+        for key in ("py", "s_y", "weights"):
+            arr = snap.get(key, None)
+            if arr is not None:
+                row[f"{key}_json"] = json.dumps(np.asarray(arr).tolist())
+        client_kls = snap.get("client_kls", None)
+        if client_kls is not None:
+            arr = np.asarray(client_kls, dtype=np.float64)
+            row["kl_mean"] = float(np.nanmean(arr)) if arr.size else np.nan
+            row["kl_max"] = float(np.nanmax(arr)) if arr.size else np.nan
+        client_ns = snap.get("client_ns", None)
+        if client_ns is not None:
+            row["client_ns_json"] = json.dumps(np.asarray(client_ns).astype(int).tolist())
+        client_cids = snap.get("client_cids", None)
+        if client_cids is not None:
+            row["client_cids_json"] = json.dumps([str(c) for c in client_cids])
+        if "nll_clients" in snap:
+            row["nll_clients"] = int(snap.get("nll_clients", 0))
+        for key in ("theta_drift_max", "theta_drift_mean",
+                    "gamma_mult_min", "gamma_mult_max", "py_l1_error"):
+            if key in snap:
+                row[key] = float(snap[key])
+        round_rows.append(row)
+    try:
+        pd.DataFrame(round_rows).to_csv(diag_dir / "global_round_stats.csv", index=False)
+    except Exception as e:
+        print(f"[diag] Failed to write global_round_stats: {e}")
+
+    try:
+        (diag_dir / "fold_config.json").write_text(json.dumps(fold_config, indent=2))
+    except Exception as e:
+        print(f"[diag] Failed to write fold_config: {e}")
+
+    try:
+        parents_excl_y = {int(v): list(pa) for v, pa in parents_glob.items()}
+        payload = _gm_to_payload(gm, card_glob, parents_excl_y, y_index_glob)
+        payload = {
+            "py": np.asarray(payload["py"]).tolist(),
+            "thetas": {str(v): np.asarray(t).tolist() for v, t in payload["thetas"].items()},
+            "card": list(map(int, payload["card"])),
+            "y_index": int(payload["y_index"]),
+            "parents": {str(v): list(map(int, pa)) for v, pa in payload["parents"].items()},
+        }
+        (diag_dir / "final_global_model.json").write_text(json.dumps(payload))
+    except Exception as e:
+        print(f"[diag] Failed to write final_global_model: {e}")
+
+
 def run_one_fold_fed_ganblr(
     Xtr_int, ytr_int, Xte_int, yte_int, card_feat, num_classes,
     k_global=2, num_clients=5, num_rounds=5, dir_alpha=0.1,
@@ -377,7 +468,10 @@ def run_one_fold_fed_ganblr(
     eval_syn_frac: float = 1.0,
     split_seed: int = 42,
     ray_local_mode: bool = False,
-    diagnostics_dir: str | Path | None = None
+    diagnostics_dir: str | Path | None = None,
+    bootstrap: str = "mle", warmup_epochs: int = 1, warmup_steps: int = 0,
+    local_lr: float = 1e-3,
+    freeze_py: bool = False, py_from_counts: bool = False, normalize_kl: bool = True,
 ):
     """
     Run one federated simulation on this fold and return TSTR metrics.
@@ -399,45 +493,23 @@ def run_one_fold_fed_ganblr(
     clients_data = dirichlet_split(Xtr_int, ytr_int, num_clients=num_clients, alpha=dir_alpha,
                                    rng=np.random.default_rng(int(split_seed)))
 
+    _fold_knobs = {
+        "k_global": k_global, "num_clients": num_clients, "num_rounds": num_rounds,
+        "dir_alpha": dir_alpha, "gamma": gamma, "local_epochs": local_epochs,
+        "batch_size": batch_size, "disc_epochs": disc_epochs, "cpt_mix": cpt_mix,
+        "beta_pow": beta_pow, "kl_lambda": kl_lambda,
+        "use_theta_weights": use_theta_weights, "alpha_mix": alpha_mix,
+        "tau_floor": tau_floor, "eval_syn_frac": eval_syn_frac,
+        "bootstrap": bootstrap, "warmup_epochs": warmup_epochs, "warmup_steps": warmup_steps,
+        "local_lr": local_lr,
+        "freeze_py": freeze_py, "py_from_counts": py_from_counts,
+        "normalize_kl": normalize_kl,
+    }
+
     diag_dir = Path(diagnostics_dir) if diagnostics_dir is not None else None
     if diag_dir:
         diag_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            train_counts = np.bincount(ytr_int, minlength=num_classes).tolist()
-            test_counts = np.bincount(yte_int, minlength=num_classes).tolist()
-            client_stats = []
-            for cid, (_, yc) in enumerate(clients_data):
-                counts = np.bincount(yc, minlength=num_classes)
-                total = int(counts.sum())
-                frac = (counts / max(1, total)).tolist()
-                client_stats.append({
-                    "client": cid,
-                    "n": total,
-                    "label_counts": counts.astype(int).tolist(),
-                    "label_frac": frac,
-                })
-            meta = {
-                "num_clients": num_clients,
-                "num_rounds": num_rounds,
-                "dir_alpha": dir_alpha,
-                "gamma": gamma,
-                "local_epochs": local_epochs,
-                "batch_size": batch_size,
-                "disc_epochs": disc_epochs,
-                "cpt_mix": cpt_mix,
-                "beta_pow": beta_pow,
-                "kl_lambda": kl_lambda,
-                "use_theta_weights": use_theta_weights,
-                "alpha_mix": alpha_mix,
-                "tau_floor": tau_floor,
-                "eval_syn_frac": eval_syn_frac,
-                "train_class_counts": train_counts,
-                "test_class_counts": test_counts,
-                "client_splits": client_stats,
-            }
-            (diag_dir / "client_split_stats.json").write_text(json.dumps(meta, indent=2))
-        except Exception as e:
-            print(f"[diag] Failed to write client split stats: {e}")
+        write_client_split_stats(diag_dir, ytr_int, yte_int, num_classes, clients_data, _fold_knobs)
 
     strategy = KDBGANStrategy(
         k=k_global,
@@ -452,7 +524,14 @@ def run_one_fold_fed_ganblr(
         alpha_mix=alpha_mix,
         tau_floor=tau_floor,
         adversarial=True,
-        nll_csv_path=None,  # disable NLL CSV writing
+        nll_csv_path=(str(diag_dir / "nll_convergence.csv") if diag_dir else None),
+        bootstrap=bootstrap,
+        warmup_epochs=warmup_epochs,
+        warmup_steps=warmup_steps,
+        local_lr=local_lr,
+        freeze_py=freeze_py,
+        py_from_counts=py_from_counts,
+        normalize_kl=normalize_kl,
     )
     strategy.set_global_meta(card=card_glob, parents=parents_glob, y_index=y_index_glob)
 
@@ -526,52 +605,8 @@ def run_one_fold_fed_ganblr(
             pass
 
     if diag_dir:
-        round_rows = []
-        for rnd, snap in sorted(strategy.model_snapshots.items()):
-            row = {"round": int(rnd)}
-            for key in ("py", "s_y", "weights"):
-                arr = snap.get(key, None)
-                if arr is not None:
-                    row[f"{key}_json"] = json.dumps(np.asarray(arr).tolist())
-            client_kls = snap.get("client_kls", None)
-            if client_kls is not None:
-                arr = np.asarray(client_kls, dtype=np.float64)
-                row["kl_mean"] = float(np.nanmean(arr)) if arr.size else np.nan
-                row["kl_max"] = float(np.nanmax(arr)) if arr.size else np.nan
-            client_ns = snap.get("client_ns", None)
-            if client_ns is not None:
-                row["client_ns_json"] = json.dumps(np.asarray(client_ns).astype(int).tolist())
-            if "nll_clients" in snap:
-                row["nll_clients"] = int(snap.get("nll_clients", 0))
-            round_rows.append(row)
-        try:
-            pd.DataFrame(round_rows).to_csv(diag_dir / "global_round_stats.csv", index=False)
-        except Exception as e:
-            print(f"[diag] Failed to write global_round_stats: {e}")
-
-        try:
-            fold_config = {
-                "k_global": k_global,
-                "num_clients": num_clients,
-                "num_rounds": num_rounds,
-                "dir_alpha": dir_alpha,
-                "gamma": gamma,
-                "local_epochs": local_epochs,
-                "batch_size": batch_size,
-                "disc_epochs": disc_epochs,
-                "cpt_mix": cpt_mix,
-                "eval_syn_frac": eval_syn_frac,
-            }
-            (diag_dir / "fold_config.json").write_text(json.dumps(fold_config, indent=2))
-        except Exception as e:
-            print(f"[diag] Failed to write fold_config: {e}")
-
-        try:
-            parents_excl_y = {int(v): list(pa) for v, pa in parents_glob.items()}
-            payload = _gm_to_payload(gm, card_glob, parents_excl_y, y_index_glob)
-            (diag_dir / "final_global_model.json").write_text(json.dumps(payload))
-        except Exception as e:
-            print(f"[diag] Failed to write final_global_model: {e}")
+        write_round_diagnostics(diag_dir, strategy, gm, card_glob, parents_glob,
+                                y_index_glob, _fold_knobs)
         out["diagnostics_dir"] = str(diag_dir)
     return out
 

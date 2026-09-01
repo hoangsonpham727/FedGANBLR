@@ -5,7 +5,8 @@ import time
 from pathlib import Path
 import json
 
-from evaluation import build_full_table, dirichlet_split, _evaluate_synthetic_classifiers, _gm_to_payload
+from evaluation import (build_full_table, dirichlet_split, _evaluate_synthetic_classifiers,
+                        _gm_to_payload, write_client_split_stats, write_round_diagnostics)
 from federated_models.FedGanblr import build_global_kdb_from_gm
 from federated_models.FedGanblr_FedStruct import KDBGANStrategy_FedStruct, GANBLRFederatedClient_FedStruct
 
@@ -19,7 +20,10 @@ def run_one_fold_fed_ganblr_fedstruct(
     eval_syn_frac: float = 1.0,
     split_seed: int = 42,
     ray_local_mode: bool = True,
-    diagnostics_dir: str | Path | None = None
+    diagnostics_dir: str | Path | None = None,
+    bootstrap: str = "mle", warmup_epochs: int = 1, warmup_steps: int = 0,
+    local_lr: float = 1e-3,
+    freeze_py: bool = False, py_from_counts: bool = False, normalize_kl: bool = True,
 ):
     if cap_train is not None and len(Xtr_int) > cap_train:
         sel = np.random.default_rng(1).choice(len(Xtr_int), size=cap_train, replace=False)
@@ -35,10 +39,24 @@ def run_one_fold_fed_ganblr_fedstruct(
     clients_data = dirichlet_split(Xtr_int, ytr_int, num_clients=num_clients, alpha=dir_alpha,
                                    rng=np.random.default_rng(int(split_seed)))
 
+    _fold_knobs = {
+        "k_global": k_global, "num_clients": num_clients, "num_rounds": num_rounds,
+        "dir_alpha": dir_alpha, "gamma": gamma, "local_epochs": local_epochs,
+        "batch_size": batch_size, "disc_epochs": disc_epochs, "cpt_mix": cpt_mix,
+        "beta_pow": beta_pow, "kl_lambda": kl_lambda,
+        "use_theta_weights": use_theta_weights, "alpha_mix": alpha_mix,
+        "tau_floor": tau_floor, "eval_syn_frac": eval_syn_frac,
+        "bootstrap": bootstrap, "warmup_epochs": warmup_epochs, "warmup_steps": warmup_steps,
+        "local_lr": local_lr,
+        "freeze_py": freeze_py, "py_from_counts": py_from_counts,
+        "normalize_kl": normalize_kl,
+    }
+
     diag_dir = Path(diagnostics_dir) if diagnostics_dir is not None else None
     if diag_dir:
         diag_dir.mkdir(parents=True, exist_ok=True)
-        # We can dump initial stats similar to regular evaluation
+        write_client_split_stats(diag_dir, ytr_int, yte_int, int(num_classes),
+                                 clients_data, _fold_knobs)
 
     strategy = KDBGANStrategy_FedStruct(
         k=k_global,
@@ -53,7 +71,14 @@ def run_one_fold_fed_ganblr_fedstruct(
         alpha_mix=alpha_mix,
         tau_floor=tau_floor,
         adversarial=True,
-        nll_csv_path=None,
+        nll_csv_path=(str(diag_dir / "nll_convergence.csv") if diag_dir else None),
+        bootstrap=bootstrap,
+        warmup_epochs=warmup_epochs,
+        warmup_steps=warmup_steps,
+        local_lr=local_lr,
+        freeze_py=freeze_py,
+        py_from_counts=py_from_counts,
+        normalize_kl=normalize_kl,
     )
     # Seed the strategy with bare minimum (card and y_index). `parents` starts empty.
     strategy.set_global_meta(card=card_all, parents={}, y_index=y_index)
@@ -111,6 +136,11 @@ def run_one_fold_fed_ganblr_fedstruct(
         out["fed_global_model"] = _gm_to_payload(gm, card_all, parents_glob, y_index)
     except Exception:
         out["fed_global_model"] = gm
+
+    if diag_dir:
+        write_round_diagnostics(diag_dir, strategy, gm, card_all, parents_glob,
+                                y_index, _fold_knobs)
+        out["diagnostics_dir"] = str(diag_dir)
 
     if ray_local_mode:
         try:
