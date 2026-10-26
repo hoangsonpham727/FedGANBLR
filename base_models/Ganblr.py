@@ -11,6 +11,13 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, log_loss
 from utils import _safe_log_loss
 
+
+def _onehot(X_int: np.ndarray, feat_cards: list[int]) -> np.ndarray:
+    """One-hot encode integer feature columns given their cardinalities."""
+    parts = [np.eye(r, dtype=np.float32)[X_int[:, j]] for j, r in enumerate(feat_cards)]
+    return np.concatenate(parts, axis=1) if parts else np.zeros((X_int.shape[0], 0), dtype=np.float32)
+
+
 class SimpleGANBLR:
     """
     Simplified GANBLR: generator only (MLE_KDB).  
@@ -32,12 +39,8 @@ class SimpleGANBLR:
 
     # ---------- internal helpers ----------
     def _onehot_feats(self, X_int: np.ndarray) -> np.ndarray:
-        parts = []
-        feat_indices = [v for v in range(len(self.card)) if v != self.y_index]
-        for j, v in enumerate(feat_indices):
-            r = self.card[v]
-            parts.append(np.eye(r, dtype=np.float32)[X_int[:, j]])
-        return np.concatenate(parts, axis=1) if parts else np.zeros((X_int.shape[0], 0), dtype=np.float32)
+        feat_cards = [self.card[v] for v in range(len(self.card)) if v != self.y_index]
+        return _onehot(X_int, feat_cards)
 
     def _build_discriminator(self, input_dim: int):
         # kept for API compatibility but not used
@@ -124,22 +127,33 @@ class SimpleGANBLR:
 
 class GANBLR:
     """
-    GANBLR with adversarial training where both Generator and Discriminator are KDBs.
-    - Generator: Disc_KDB (here: DiscBN_KDB with constrained=True) — KDBe-style CPTs trained by gradient.
-    - Discriminator: Simple Logisctic Regression model — predicts is_real ∈ {0,1}.
-    Logic: generator initialized randomly, then adversarial rounds:
-      1) sample synthetic rows from G,
-      2) train D on real(1) vs fake(0) for a few epochs,
-      3) compute weights w = 1 - P_D(is_real=1 | X_real),
-      4) resample real rows by w and update G one discriminative epoch.
-    Notes:
-      - KDB parent parameter k is the structure hyperparameter (not the D-repeat count).
-      - Use disc_epochs to control D training intensity each round.
-      - Generator uses random initialization (not MLE) to ensure meaningful gradient updates.
+    GANBLR (Zhang et al., ICDM 2021) with a KDB generator and a logistic-regression discriminator.
+    - Generator: DiscBN_KDB (constrained=True) — softmax CPTs trained by gradient on -log P(y|x).
+    - Discriminator: logistic regression on one-hot features — predicts is_real ∈ {0,1}.
+
+    variant="paper" (default), following the paper / reference code:
+      - generator initialized randomly, warmed up on -log P(y|x), no L2;
+      - each round: sample S_data from G, train one persistent D for disc_epochs epochs,
+        then one generator epoch on -log P(y|x) - log(1 - D(S_data)) (Eq. 2).
+        As in the reference code, the D term is a constant, so it does not change the gradient.
+    variant="reweight" (previous implementation, kept for reproducibility):
+      - generator initialized from MLE CPTs, L2 1e-5;
+      - each round D is refit from scratch (L-BFGS) and real rows are resampled
+        by w(x) = D(x)/(1-D(x)) before the generator epoch.
+
+    Remaining differences from the paper: CPTs are softmax-constrained rather than the paper's
+    unconstrained log-linear weights, and defaults (k=2, batch_size, Adam 1e-3) differ from the
+    reference code (k=0, batch_size=32).
     """
-    def __init__(self, adversarial: bool = False, alpha: float = 1.0, seed: int = 123):
+    VARIANTS = ("paper", "reweight")
+
+    def __init__(self, adversarial: bool = False, alpha: float = 1.0, seed: int = 123, variant: str = "paper"):
+        if variant not in self.VARIANTS:
+            raise ValueError(f"variant must be one of {self.VARIANTS}, got {variant!r}")
+        self.variant = variant
         self.alpha = float(alpha)
         self.seed = int(seed)
+        self._rng = np.random.default_rng(self.seed)
 
         # learned in fit()
         self.k = 0
@@ -160,16 +174,118 @@ class GANBLR:
         self.adversarial = adversarial
 
     # ---------- internals ----------
-    def _build_gen_from_mle(self, mle: 'MLE_KDB', parents_excl_y: dict[int, list[int]], jitter_std: float = 0.0) -> 'DiscBN_KDB':
-        # Create generator with random initialization (MLE initialization removed per user request)
-        gen = DiscBN_KDB(self.card, self.y_index, parents_excl_y, constrained=True, seed=self.seed)
-        # Note: DiscBN_KDB.__init__ already initializes parameters randomly, so no need to call init_from_mle
-        return gen
+    def _build_discriminator(self, input_dim: int):
+        # logistic regression on one-hot features, as in the paper
+        model = keras.Sequential([
+            keras.Input(shape=(input_dim,)),
+            keras.layers.Dense(1, activation="sigmoid"),
+        ])
+        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+        return model
 
     def _topo_from_parents(self, V: int, y_index: int, parents_excl_y: dict[int, list[int]]) -> list[int]:
         return _topo_order_from_parents(parents_excl_y, V, y_index)
 
-    def _run_adversarial_training(self,
+    def _run_adversarial_training(self, *args, **kwargs):
+        """Dispatch to the adversarial loop selected by self.variant (same signature for both)."""
+        if getattr(self, "variant", "paper") == "reweight":
+            return self._adv_reweight(*args, **kwargs)
+        return self._adv_paper(*args, **kwargs)
+
+    def _adv_paper(self,
+                   X: np.ndarray,
+                   y: np.ndarray,
+                   epochs: int,
+                   batch_size: int,
+                   disc_epochs: int,
+                   rng: np.random.Generator,
+                   rng_local: Optional[np.random.Generator] = None,
+                   verbose: int = 0,
+                   initial_disc_train: bool = False,
+                   kl_targets: Optional[dict[int, np.ndarray]] = None,
+                   kl_lambda: float = 0.0,
+                   s_y: Optional[np.ndarray] = None,
+                   kl_s_weights: Optional[dict[int, np.ndarray]] = None,
+                   client_id: Optional[str] = None,
+                   seed_fn: Optional[Callable] = None):
+        """
+        Adversarial training as in the paper:
+          * Discriminator step -> Eq. 7: max log D(D_data) + log(1 - D(S_data))
+          * Generator step     -> Eq. 2: max log P(Y|X) - log(1 - D(S_data))
+        """
+        if self.generator is None:
+            raise RuntimeError("Generator not initialized")
+
+        import tensorflow as tf
+
+        gen = self.generator
+        N = X.shape[0]
+        data_real = np.column_stack([y, X]).astype(np.int32)
+        feat_cards = [self.card[v] for v in range(len(self.card)) if v != self.y_index]
+        X_real_oh = _onehot(X, feat_cards)
+
+        # one persistent logistic-regression discriminator for the whole run
+        self.disc = self._build_discriminator(X_real_oh.shape[1])
+
+        vars_ = [gen.logits_y] + list(gen.logits_v.values())
+        kl_lambda_tf = tf.constant(float(kl_lambda or 0.0), dtype=tf.float32)
+        kl_targets_tf, kl_weights_tf = {}, {}
+        if getattr(gen, "federated", False) and kl_lambda > 0.0 and kl_targets:
+            for v, arr in kl_targets.items():
+                kl_targets_tf[int(v)] = tf.constant(np.asarray(arr, np.float32))
+            if kl_s_weights:
+                for v, arr in kl_s_weights.items():
+                    kl_weights_tf[int(v)] = tf.constant(np.asarray(arr, np.float32))
+
+        log_prefix = f"[Client {client_id}]" if client_id else "[GANBLR]"
+        if verbose > 0:
+            print(f"{log_prefix} Starting adversarial training (paper): {epochs} epochs")
+
+        bsz = min(batch_size, N)
+        idx_all = np.arange(N)
+        for ep in range(1, epochs + 1):
+            # 1) Sample synthetic data (Eq. 6)
+            samp_rng = np.random.default_rng(seed_fn(ep)) if seed_fn is not None else rng
+            syn_full = self._sample_full_from_gen(n=N, rng=samp_rng, order=self.order)
+            X_fake_oh = _onehot(syn_full[:, 1:].astype(np.int32), feat_cards)
+
+            # 2) Train discriminator (Eq. 7): real -> 1, synthetic -> 0
+            X_disc = np.vstack([X_real_oh, X_fake_oh])
+            y_disc = np.concatenate([np.ones(N, np.float32), np.zeros(N, np.float32)])
+            hist = self.disc.fit(X_disc, y_disc, epochs=max(1, int(disc_epochs)),
+                                 batch_size=bsz, shuffle=True, verbose=0)
+
+            # 3) Adversarial term on the synthetic rows: -log(1 - D(S_data))
+            d_fake = np.clip(self.disc.predict(X_fake_oh, verbose=0).ravel(), 1e-7, 1.0 - 1e-7)
+            adv_loss = tf.constant(float(-np.mean(np.log(1.0 - d_fake))), dtype=tf.float32)
+
+            # 4) Generator epoch on -log P(Y|X) + adversarial term (Eq. 2)
+            rng.shuffle(idx_all)
+            for s in range(0, N, bsz):
+                x_tf = tf.convert_to_tensor(data_real[idx_all[s:s + bsz]], dtype=tf.int32)
+                with tf.GradientTape() as tape:
+                    loss = gen._nll_batch(x_tf) + adv_loss
+
+                    # KL term (federated only)
+                    if getattr(gen, "federated", False) and kl_lambda > 0.0 and kl_targets_tf:
+                        kl_loss = tf.constant(0.0, dtype=tf.float32)
+                        for v, logits in gen.logits_v.items():
+                            if int(v) not in kl_targets_tf:
+                                continue
+                            theta_local = tf.clip_by_value(tf.nn.softmax(logits, axis=-1), 1e-8, 1.0)
+                            theta_tgt = tf.clip_by_value(kl_targets_tf[int(v)], 1e-8, 1.0)
+                            W = kl_weights_tf.get(int(v), tf.ones_like(theta_local))
+                            el = W * (theta_local * (tf.math.log(theta_local) - tf.math.log(theta_tgt)))
+                            kl_loss += tf.reduce_mean(tf.reduce_sum(el, axis=1))
+                        loss = loss + tf.multiply(kl_lambda_tf, kl_loss)
+                grads = tape.gradient(loss, vars_)
+                gen.opt.apply_gradients(zip(grads, vars_))
+
+            if verbose > 0:
+                print(f"{log_prefix} Epoch {ep}/{epochs}: D-loss={hist.history['loss'][-1]:.4f}  "
+                      f"D-acc={hist.history['accuracy'][-1]:.4f}  adv={float(adv_loss):.4f}")
+
+    def _adv_reweight(self,
                                   X: np.ndarray,
                                   y: np.ndarray,
                                   epochs: int,
@@ -368,6 +484,7 @@ class GANBLR:
                        If None, uses self.adversarial from initialization.
         """
         rng = np.random.default_rng(self.seed)
+        self._rng = np.random.default_rng(self.seed)
 
         X = np.asarray(X_int, dtype=np.int32)
         y = np.asarray(y_int, dtype=np.int32)
@@ -393,16 +510,18 @@ class GANBLR:
         self.parents = parents_excl_y
         self.order = order
 
-        # Initialize generator from MLE model
-        mle = MLE_KDB(self.card, self.y_index, parents_excl_y, alpha = self.alpha)
-        mle.fit(data)
-        # DiscBN_KDB.__init__ already initializes parameters randomly
+        # DiscBN_KDB.__init__ initializes parameters randomly (paper);
+        # the reweight variant overwrites them with MLE CPTs.
         gen = DiscBN_KDB(self.card, self.y_index, parents_excl_y, constrained=True, seed=self.seed)
-        gen.init_from_mle(mle, jitter_std=0.0)
+        l2 = 0.0 if self.variant == "paper" else 1e-5
+        if self.variant == "reweight":
+            mle = MLE_KDB(self.card, self.y_index, parents_excl_y, alpha = self.alpha)
+            mle.fit(data)
+            gen.init_from_mle(mle, jitter_std=0.0)
         if warmup_epochs > 0:
             if verbose > 0:
                 print(f"[GANBLR] Starting warmup: {warmup_epochs} epochs")
-            gen.fit(data, epochs=warmup_epochs, batch_size=min(batch_size, data.shape[0]), l2=1e-5, verbose=verbose)
+            gen.fit(data, epochs=warmup_epochs, batch_size=min(batch_size, data.shape[0]), l2=l2, verbose=verbose)
         self.generator = gen
         
         # Determine if adversarial training should be used
@@ -418,7 +537,7 @@ class GANBLR:
                     data,
                     epochs=int(epochs),
                     batch_size=min(batch_size, data.shape[0]),
-                    l2=1e-5,
+                    l2=l2,
                     verbose=verbose
                 )
             if verbose > 0:
@@ -447,8 +566,7 @@ class GANBLR:
         if not self._fitted or self.generator is None:
             raise RuntimeError("Call fit() first.")
         n = self._X.shape[0] if size is None else int(size)
-        rng = np.random.default_rng(self.seed)
-        syn_full = self._sample_full_from_gen(n=n, rng=rng, order=self.order)
+        syn_full = self._sample_full_from_gen(n=n, rng=self._rng, order=self.order)
         y_syn = syn_full[:, 0]
         X_syn = syn_full[:, 1:]
         return (X_syn, y_syn) if return_decoded else (X_syn, y_syn)
